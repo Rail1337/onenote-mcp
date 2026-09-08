@@ -1,0 +1,47 @@
+{
+  "manifest_version": "0.4",
+  "name": "onenote-mcp",
+  "display_name": "OneNote (Local)",
+  "version": "1.0.0",
+  "description": "Read and write local Microsoft OneNote notebooks, both from local backups and live via the running OneNote app. No account, API key, or Azure setup needed.",
+  "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks. Reads from OneNote's local backup snapshots for quick browsing and search, and drives the running OneNote desktop app via its COM API for always-current reads plus writing: creating sections and pages, and appending content.\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author -- adding live page/section reading, live section creation, a page-title escaping fix, and language-independent backup detection. Stays open source under the same MIT license.",
+  "author": {
+    "name": "Rail1337"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rail1337/onenote-mcp.git"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "server.py"]
+    }
+  },
+  "tools": [
+    { "name": "list_notebooks", "description": "List all notebooks found in the local backup" },
+    { "name": "list_sections", "description": "List sections in a notebook" },
+    { "name": "read_section", "description": "Read all text content of a section (from local backup)" },
+    { "name": "search_notes", "description": "Search text across every notebook and section" },
+    { "name": "list_all_sections", "description": "Full overview of every section in every notebook" },
+    { "name": "get_notebook_summary", "description": "Notebook overview with content previews" },
+    { "name": "list_live_notebooks", "description": "List notebooks/sections currently open in OneNote" },
+    { "name": "create_section", "description": "Create a brand-new section in a notebook" },
+    { "name": "create_page", "description": "Create a new page in a section" },
+    { "name": "list_live_pages", "description": "List pages in a section, with IDs for reading/appending" },
+    { "name": "read_live_page", "description": "Read the full text of a single live page" },
+    { "name": "read_live_section", "description": "Read every page in a section, live" },
+    { "name": "append_to_page", "description": "Append content to an existing page" }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["win32"],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  },
+  "keywords": ["onenote", "notes", "productivity"],
+  "license": "MIT"
+}

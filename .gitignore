@@ -11,3 +11,6 @@ wheels/
 
 # Token cache (contains auth secrets)
 .onenote_token_cache.json
+
+# Packed extension bundles (build artifacts)
+*.mcpb

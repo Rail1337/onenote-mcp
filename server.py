@@ -26,6 +26,7 @@ Usage with Claude Code:
     claude mcp add --transport stdio onenote -- uv --directory "path/to/this/project" run server.py
 """
 
+import html
 import logging
 import os
 import re
@@ -42,15 +43,52 @@ from mcp.server.fastmcp import FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Where OneNote stores local backup files.
-# Override with ONENOTE_BACKUP_DIR environment variable if yours is elsewhere.
-DEFAULT_BACKUP_DIR = Path(
-    os.environ.get("APPDATA", ""),
-).parent / "Local" / "Microsoft" / "OneNote" / "16.0" / "Backup"
-
-ONENOTE_DIR = Path(
-    os.environ.get("ONENOTE_BACKUP_DIR", str(DEFAULT_BACKUP_DIR))
+# Where OneNote stores local backup files. The folder is auto-detected because
+# its name is localized by Windows/Office language (English: "Backup", German:
+# "Sicherung", French: "Sauvegarde", ...). Override with ONENOTE_BACKUP_DIR if
+# your backups live somewhere non-standard.
+_NON_BACKUP_DIR_NAMES = {
+    "accessibilitycheckerindex", "fulltextsearchindex", "masterindex",
+    "serverlistings", "cache", "offlinefilesinfo",
+}
+_KNOWN_BACKUP_DIR_NAMES = (
+    "Backup", "Sicherung", "Sauvegarde", "Copia di backup",
+    "Copia de seguridad", "Reservekopie", "Backup-kopie",
 )
+
+
+def _detect_backup_dir() -> Path:
+    env_override = os.environ.get("ONENOTE_BACKUP_DIR")
+    if env_override:
+        return Path(env_override)
+
+    onenote_root = Path(
+        os.environ.get("LOCALAPPDATA", "")
+    ) / "Microsoft" / "OneNote" / "16.0"
+
+    if onenote_root.is_dir():
+        # Fast path: try known localized names first.
+        for candidate_name in _KNOWN_BACKUP_DIR_NAMES:
+            candidate = onenote_root / candidate_name
+            if candidate.is_dir() and any(candidate.rglob("*.one")):
+                return candidate
+
+        # Fallback: scan every subfolder and use whichever one actually
+        # contains .one files (covers languages not in the list above).
+        for entry in onenote_root.iterdir():
+            if not entry.is_dir():
+                continue
+            if entry.name.lower() in _NON_BACKUP_DIR_NAMES:
+                continue
+            if any(entry.rglob("*.one")):
+                return entry
+
+    # Nothing found; return the English default so the startup error message
+    # points at a sensible path.
+    return onenote_root / "Backup"
+
+
+ONENOTE_DIR = _detect_backup_dir()
 
 # ---------------------------------------------------------------------------
 # Logging (to stderr so it doesn't break stdio MCP transport)
@@ -434,6 +472,11 @@ def _sanitize_html_for_onenote(html: str) -> str:
     return html.strip()
 
 
+def _escape_cdata(text: str) -> str:
+    """Escape ]]> so it can't prematurely close a CDATA section."""
+    return text.replace("]]>", "]]&gt;")
+
+
 def _run_powershell(script: str) -> tuple[bool, str]:
     """Run a PowerShell script and return (success, output)."""
     try:
@@ -484,6 +527,59 @@ def _com_get_hierarchy(level: int = 3) -> ET.Element | None:
             pass
 
 
+def _com_get_page_content(page_id: str) -> str | None:
+    """Fetch the raw page content XML for a live page via the COM API."""
+    tmpfile = os.path.join(tempfile.gettempdir(), "onenote_page_content.xml")
+    tmpfile_ps = tmpfile.replace("\\", "\\\\")
+    page_id_esc = page_id.replace("'", "''")
+    script = (
+        f'$onenote = New-Object -ComObject OneNote.Application; '
+        f'$p = ""; '
+        f"$onenote.GetPageContent('{page_id_esc}', [ref]$p, 0); "
+        f'$p | Out-File -FilePath "{tmpfile_ps}" -Encoding UTF8; '
+        f'Write-Output "OK"'
+    )
+    ok, msg = _run_powershell(script)
+    if not ok:
+        log.warning("COM GetPageContent failed for %s: %s", page_id, msg)
+        return None
+    try:
+        with open(tmpfile, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except Exception as e:
+        log.warning("Failed to read page content file: %s", e)
+        return None
+    finally:
+        try:
+            os.remove(tmpfile)
+        except OSError:
+            pass
+
+
+def _extract_text_from_page_xml(xml_content: str) -> str:
+    """Extract plain text from a OneNote page-content XML document.
+
+    Text lives in <one:T> elements, often as inline HTML (spans, bold, etc.),
+    so tags are stripped and HTML entities unescaped after extraction.
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        log.warning("Failed to parse page content XML: %s", e)
+        return ""
+
+    lines = []
+    for t in root.iter(f"{{{ONE_NS}}}T"):
+        raw = t.text or ""
+        if not raw.strip():
+            continue
+        plain = re.sub(r"<[^>]+>", "", raw)
+        plain = html.unescape(plain).strip()
+        if plain:
+            lines.append(plain)
+    return "\n".join(lines)
+
+
 def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
     """Find a section ID by notebook and section name (case-insensitive)."""
     root = _com_get_hierarchy(3)
@@ -498,6 +594,19 @@ def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
                 continue
             if sec.get("name", "").lower() == section_name.lower():
                 return sec.get("ID")
+    return None
+
+
+def _com_find_notebook_id(notebook_name: str) -> str | None:
+    """Find a notebook's ID by name (case-insensitive)."""
+    # HierarchyScope 0 ("Notebooks") returns an empty result on some OneNote
+    # versions; level 3 reliably includes Notebook elements with an ID.
+    root = _com_get_hierarchy(3)
+    if root is None:
+        return None
+    for nb in root.iter(f"{{{ONE_NS}}}Notebook"):
+        if nb.get("name", "").lower() == notebook_name.lower():
+            return nb.get("ID")
     return None
 
 
@@ -533,6 +642,34 @@ def _run_powershell_file(script: str) -> tuple[bool, str]:
             pass
 
 
+def _com_create_section(notebook_id: str, section_name: str) -> tuple[bool, str]:
+    """Create a new section in a notebook using the OneNote COM API.
+
+    Uses OpenHierarchy with newObjectType=3 (cftSection). When bstrPath is
+    passed relative to a parent object ID, it must be a filename ending in
+    ".one" -- passing just the bare section name fails with an HRESULT error.
+    """
+    section_file = f"{section_name}.one"
+    section_file_esc = section_file.replace("'", "''")
+    notebook_id_esc = notebook_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$newId = ""
+try {{
+    $onenote.OpenHierarchy('{section_file_esc}', '{notebook_id_esc}', [ref]$newId, 3)
+}} catch {{
+    Write-Error "OpenHierarchy failed: $_"
+    exit 1
+}}
+Write-Output $newId
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("create_section: notebook=%s name=%r ok=%s output=%r", notebook_id, section_name, ok, output)
+    if ok and output:
+        return True, output
+    return False, output or "Unknown error creating section"
+
+
 def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
     """Create a new page in a section using the OneNote COM API."""
     log.info("create_page: title=%r, body_len=%d, section=%s", title, len(body_html), section_id)
@@ -545,7 +682,7 @@ def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool,
     title_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_title.txt")
     body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_body.txt")
     with open(title_file, "w", encoding="utf-8") as f:
-        f.write(title)
+        f.write(_escape_cdata(title))
     with open(body_file, "w", encoding="utf-8") as f:
         f.write(body_html)
 
@@ -729,6 +866,29 @@ async def list_live_notebooks() -> str:
 
 
 @mcp.tool()
+async def create_section(notebook_name: str, section_name: str) -> str:
+    """Create a new section in a OneNote notebook (live, via COM API).
+
+    Requires the OneNote desktop app to be installed.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Name for the new section.
+    """
+    notebook_id = _com_find_notebook_id(notebook_name)
+    if notebook_id is None:
+        return (
+            f"Could not find notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available notebooks."
+        )
+
+    ok, result = _com_create_section(notebook_id, section_name)
+    if ok:
+        return f"Section '{section_name}' created successfully (ID: {result})"
+    return f"Failed to create section '{section_name}': {result}"
+
+
+@mcp.tool()
 async def create_page(notebook_name: str, section_name: str, title: str, content: str) -> str:
     """Create a new page in a OneNote notebook section.
 
@@ -779,6 +939,59 @@ async def list_live_pages(notebook_name: str, section_name: str) -> str:
     for p in pages:
         lines.append(f"- {p['name']}  (id: {p['id']})")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def read_live_page(page_id: str) -> str:
+    """Read the full text content of a single page from the running OneNote app (live).
+
+    Unlike read_section (which reads from a local backup snapshot and can be
+    outdated), this fetches the current content directly from the OneNote
+    desktop app via its COM API.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return (
+            "Could not read page. Make sure the OneNote desktop app is "
+            "installed and the page ID is correct (use list_live_pages)."
+        )
+    text = _extract_text_from_page_xml(xml_content)
+    return text or "(page has no text content)"
+
+
+@mcp.tool()
+async def read_live_section(notebook_name: str, section_name: str) -> str:
+    """Read the full text content of every page in a section from the running OneNote app (live).
+
+    Unlike read_section (which reads from a local backup snapshot and can be
+    outdated or missing recently added pages/sections entirely), this reads
+    current content directly from the OneNote desktop app via its COM API.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Name of the section within the notebook.
+    """
+    section_id = _com_find_section_id(notebook_name, section_name)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available notebooks and sections."
+        )
+
+    pages = _com_list_pages(section_id)
+    if not pages:
+        return "No pages found in this section."
+
+    parts = []
+    for p in pages:
+        xml_content = _com_get_page_content(p["id"])
+        text = _extract_text_from_page_xml(xml_content) if xml_content else ""
+        parts.append(f"## {p['name']}\n{text or '(no text content)'}")
+
+    return "\n\n".join(parts)
 
 
 @mcp.tool()
