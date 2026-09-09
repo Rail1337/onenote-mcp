@@ -1,26 +1,29 @@
 """
-OneNote MCP Server (Local Files)
-=================================
+OneNote MCP Server
+===================
 An MCP (Model Context Protocol) server that reads local OneNote (.one) files
-directly from disk and writes to OneNote via the COM API.
+directly from disk and reads/writes/organizes OneNote via the COM API.
 No Azure registration or authentication needed.
 
-Reading: parses backup files at:
-    C:\\Users\\<user>\\AppData\\Local\\Microsoft\\OneNote\\16.0\\Backup\\
+Reading: parses local backup files, auto-detected regardless of Windows/
+Office display language (e.g. English "Backup", German "Sicherung").
 
-Writing: uses the OneNote COM API via PowerShell (requires OneNote desktop app).
+Live: talks to the running OneNote desktop app via its COM API (PowerShell
+under the hood) for always-current reads, writing, and organizing.
 
-It exposes tools for Claude Code to:
-    - List all notebooks and sections
-    - Read page text content
-    - Search across all pages
-    - Create new pages in any notebook/section
-    - Append content to existing pages
+It exposes tools for Claude to:
+    - List, read, and search notebooks/sections from the local backup
+    - Read a single page or a whole section live from the running app
+    - Create, rename, move, and delete sections and section groups
+    - Create pages, append to pages, and rename pages
+    - List items in the OneNote recycle bin, and restore them via move
+    (deletes require an explicit confirm=true and only move items to the
+    recycle bin, never permanent)
 
 Prerequisites:
     pip install "mcp[cli]" pyOneNote
     (or: uv add "mcp[cli]" pyOneNote)
-    + OneNote desktop app (for write features)
+    + OneNote desktop app (for live/write features)
 
 Usage with Claude Code:
     claude mcp add --transport stdio onenote -- uv --directory "path/to/this/project" run server.py
@@ -580,8 +583,15 @@ def _extract_text_from_page_xml(xml_content: str) -> str:
     return "\n".join(lines)
 
 
-def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
-    """Find a section ID by notebook and section name (case-insensitive)."""
+def _com_find_section_id(
+    notebook_name: str, section_name: str, include_recycled: bool = False
+) -> str | None:
+    """Find a section ID by notebook and section name (case-insensitive).
+
+    Searches recursively through nested section groups. Recycle-bin items are
+    skipped by default; pass include_recycled=True to also find (and thereby
+    be able to restore) a deleted section.
+    """
     root = _com_get_hierarchy(3)
     if root is None:
         return None
@@ -590,11 +600,54 @@ def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
         if nb.get("name", "").lower() != notebook_name.lower():
             continue
         for sec in nb.iter(f"{{{ONE_NS}}}Section"):
-            if sec.get("isInRecycleBin") == "true":
+            if not include_recycled and sec.get("isInRecycleBin") == "true":
                 continue
             if sec.get("name", "").lower() == section_name.lower():
                 return sec.get("ID")
     return None
+
+
+def _com_find_section_group_id(
+    notebook_name: str, group_name: str, include_recycled: bool = False
+) -> str | None:
+    """Find a section group (folder) ID by notebook and group name (case-insensitive).
+
+    Searches recursively through nested section groups.
+    """
+    root = _com_get_hierarchy(3)
+    if root is None:
+        return None
+
+    for nb in root.iter(f"{{{ONE_NS}}}Notebook"):
+        if nb.get("name", "").lower() != notebook_name.lower():
+            continue
+        for grp in nb.iter(f"{{{ONE_NS}}}SectionGroup"):
+            if not include_recycled and grp.get("isInRecycleBin") == "true":
+                continue
+            if grp.get("name", "").lower() == group_name.lower():
+                return grp.get("ID")
+    return None
+
+
+def _format_hierarchy_tree(node: ET.Element, depth: int = 0) -> list[str]:
+    """Recursively render a Notebook/SectionGroup element's children as an
+    indented tree of section-group folders and sections, skipping recycle-bin
+    items."""
+    lines = []
+    indent = "  " * depth
+    for child in node:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "SectionGroup":
+            if child.get("isInRecycleBin") == "true":
+                continue
+            lines.append(f"{indent}- {child.get('name', '?')}/  (group)")
+            lines.extend(_format_hierarchy_tree(child, depth + 1))
+        elif tag == "Section":
+            if child.get("isInRecycleBin") == "true":
+                continue
+            locked = " (locked)" if child.get("locked") == "true" else ""
+            lines.append(f"{indent}- {child.get('name', '?')}{locked}")
+    return lines
 
 
 def _com_find_notebook_id(notebook_name: str) -> str | None:
@@ -668,6 +721,105 @@ Write-Output $newId
     if ok and output:
         return True, output
     return False, output or "Unknown error creating section"
+
+
+def _com_create_section_group(notebook_id: str, group_name: str) -> tuple[bool, str]:
+    """Create a new section group (folder) in a notebook using OpenHierarchy
+    with newObjectType=2 (cftFolder). Unlike sections, group paths take no
+    file extension.
+    """
+    group_name_esc = group_name.replace("'", "''")
+    notebook_id_esc = notebook_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$newId = ""
+try {{
+    $onenote.OpenHierarchy('{group_name_esc}', '{notebook_id_esc}', [ref]$newId, 2)
+}} catch {{
+    Write-Error "OpenHierarchy failed: $_"
+    exit 1
+}}
+Write-Output $newId
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("create_section_group: notebook=%s name=%r ok=%s output=%r", notebook_id, group_name, ok, output)
+    if ok and output:
+        return True, output
+    return False, output or "Unknown error creating section group"
+
+
+def _com_move_section(section_id: str, destination_id: str, destination_tag: str) -> tuple[bool, str]:
+    """Move an existing section (by ID) under a different parent (notebook or
+    section group, by ID) using UpdateHierarchy. Wrapping the existing
+    section's ID as a child of the target parent reparents it instead of
+    creating a duplicate. Also works to move a section out of the recycle
+    bin (restore), since the recycle bin is itself a section group.
+
+    destination_tag must be "Notebook" or "SectionGroup" to match what
+    destination_id actually refers to -- using the wrong wrapper element
+    fails with an HRESULT error.
+    """
+    section_id_esc = section_id.replace("'", "''")
+    destination_id_esc = destination_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$xml = "<one:{destination_tag} xmlns:one=`"http://schemas.microsoft.com/office/onenote/2013/onenote`" ID=`"{destination_id_esc}`"><one:Section ID=`"{section_id_esc}`" /></one:{destination_tag}>"
+try {{
+    $onenote.UpdateHierarchy($xml)
+}} catch {{
+    Write-Error "UpdateHierarchy failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("move_section: section=%s dest=%s ok=%s output=%r", section_id, destination_id, ok, output)
+    if ok:
+        return True, "Section moved successfully."
+    return False, output or "Unknown error moving section"
+
+
+def _com_rename_section(section_id: str, new_name: str) -> tuple[bool, str]:
+    """Rename an existing section (by ID) using UpdateHierarchy."""
+    section_id_esc = section_id.replace("'", "''")
+    new_name_esc = new_name.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$xml = "<one:Section xmlns:one=`"http://schemas.microsoft.com/office/onenote/2013/onenote`" ID=`"{section_id_esc}`" name=`"{new_name_esc}`" />"
+try {{
+    $onenote.UpdateHierarchy($xml)
+}} catch {{
+    Write-Error "UpdateHierarchy failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("rename_section: section=%s new_name=%r ok=%s output=%r", section_id, new_name, ok, output)
+    if ok:
+        return True, "Section renamed successfully."
+    return False, output or "Unknown error renaming section"
+
+
+def _com_delete_hierarchy(object_id: str) -> tuple[bool, str]:
+    """Delete a hierarchy object (section or page) by ID using DeleteHierarchy.
+    Moves to the OneNote recycle bin (does not pass deletePermanently)."""
+    object_id_esc = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+try {{
+    $onenote.DeleteHierarchy('{object_id_esc}')
+}} catch {{
+    Write-Error "DeleteHierarchy failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("delete_hierarchy: object=%s ok=%s output=%r", object_id, ok, output)
+    if ok:
+        return True, "Deleted (moved to OneNote recycle bin)."
+    return False, output or "Unknown error deleting"
 
 
 def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
@@ -757,6 +909,50 @@ Write-Output $pageId
                 pass
 
 
+def _com_rename_page(page_id: str, new_title: str) -> tuple[bool, str]:
+    """Rename an existing page's title, leaving its body content untouched."""
+    title_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_title.txt")
+    with open(title_file, "w", encoding="utf-8") as f:
+        f.write(_escape_cdata(new_title))
+
+    page_id_esc = page_id.replace("'", "''")
+    script = f"""
+$titleContent = Get-Content -Path '{title_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($titleContent) {{ $titleContent = $titleContent.Trim() }}
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$titleNode = $xml.SelectSingleNode("//one:Title/one:OE/one:T", $nsMgr)
+if ($titleNode) {{
+    $titleNode.InnerXml = "<![CDATA[" + $titleContent + "]]>"
+}}
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Title UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("rename_page: page=%s new_title=%r ok=%s output=%r", page_id, new_title, ok, output)
+        if ok:
+            return True, "Page renamed successfully."
+        return False, output or "Unknown error renaming page"
+    finally:
+        try:
+            os.remove(title_file)
+        except OSError:
+            pass
+
+
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
     """Append content to an existing page using the OneNote COM API."""
     log.info("append_to_page: page=%s, body_len=%d", page_id, len(body_html))
@@ -842,8 +1038,8 @@ async def list_live_notebooks() -> str:
     """List notebooks from the running OneNote app (live, not backup files).
 
     This uses the OneNote COM API and shows the notebooks currently open in
-    the OneNote desktop app, including their sections. Use this to find
-    where to create new pages.
+    the OneNote desktop app, including nested section groups (folders) and
+    sections. Use this to find where to create, move, or delete things.
     """
     root = _com_get_hierarchy(3)
     if root is None:
@@ -853,12 +1049,7 @@ async def list_live_notebooks() -> str:
     for nb in root.findall(f"{{{ONE_NS}}}Notebook"):
         nb_name = nb.get("name", "?")
         lines.append(f"\n## {nb_name}")
-        for sec in nb.iter(f"{{{ONE_NS}}}Section"):
-            if sec.get("isInRecycleBin") == "true":
-                continue
-            sec_name = sec.get("name", "?")
-            locked = " (locked)" if sec.get("locked") == "true" else ""
-            lines.append(f"  - {sec_name}{locked}")
+        lines.extend(_format_hierarchy_tree(nb, depth=1))
 
     if not lines:
         return "No notebooks found in OneNote."
@@ -886,6 +1077,203 @@ async def create_section(notebook_name: str, section_name: str) -> str:
     if ok:
         return f"Section '{section_name}' created successfully (ID: {result})"
     return f"Failed to create section '{section_name}': {result}"
+
+
+@mcp.tool()
+async def create_section_group(notebook_name: str, group_name: str) -> str:
+    """Create a new section group (folder) directly under a notebook.
+
+    Requires the OneNote desktop app to be installed.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        group_name: Name for the new section group.
+    """
+    notebook_id = _com_find_notebook_id(notebook_name)
+    if notebook_id is None:
+        return (
+            f"Could not find notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available notebooks."
+        )
+
+    ok, result = _com_create_section_group(notebook_id, group_name)
+    if ok:
+        return f"Section group '{group_name}' created successfully (ID: {result})"
+    return f"Failed to create section group '{group_name}': {result}"
+
+
+@mcp.tool()
+async def move_section(notebook_name: str, section_name: str, destination_group_name: str = "") -> str:
+    """Move a section to a different section group, or back to the notebook's top level.
+
+    Also works to restore a deleted section out of the recycle bin -- pass
+    the recycled section's name and the group (or "") you want it restored to.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Name of the section to move (searched everywhere in the
+            notebook, including the recycle bin).
+        destination_group_name: Name of the destination section group. Leave
+            empty ("") to move the section to the notebook's top level.
+    """
+    section_id = _com_find_section_id(notebook_name, section_name, include_recycled=True)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available sections."
+        )
+
+    if destination_group_name:
+        destination_id = _com_find_section_group_id(notebook_name, destination_group_name)
+        if destination_id is None:
+            return (
+                f"Could not find section group '{destination_group_name}' in notebook '{notebook_name}'. "
+                f"Use list_live_notebooks to see available section groups."
+            )
+        destination_tag = "SectionGroup"
+    else:
+        destination_id = _com_find_notebook_id(notebook_name)
+        if destination_id is None:
+            return f"Could not find notebook '{notebook_name}'."
+        destination_tag = "Notebook"
+
+    ok, result = _com_move_section(section_id, destination_id, destination_tag)
+    if ok:
+        dest_desc = destination_group_name or f"the top level of '{notebook_name}'"
+        return f"Section '{section_name}' moved to {dest_desc}."
+    return f"Failed to move section '{section_name}': {result}"
+
+
+@mcp.tool()
+async def rename_section(notebook_name: str, section_name: str, new_name: str) -> str:
+    """Rename an existing section.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Current name of the section.
+        new_name: New name for the section.
+    """
+    section_id = _com_find_section_id(notebook_name, section_name)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available sections."
+        )
+
+    ok, result = _com_rename_section(section_id, new_name)
+    if ok:
+        return f"Section '{section_name}' renamed to '{new_name}'."
+    return f"Failed to rename section '{section_name}': {result}"
+
+
+@mcp.tool()
+async def rename_page(page_id: str, new_title: str) -> str:
+    """Rename an existing page's title, leaving its content untouched.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        new_title: New title for the page.
+    """
+    ok, result = _com_rename_page(page_id, new_title)
+    if ok:
+        return f"Page renamed to '{new_title}'."
+    return f"Failed to rename page: {result}"
+
+
+@mcp.tool()
+async def delete_section(notebook_name: str, section_name: str, confirm: bool = False) -> str:
+    """Delete a section (moves it to the OneNote recycle bin, not permanent).
+
+    This is a two-step, irreversible-feeling operation: call it once with
+    confirm left as false to get a preview of exactly what would be deleted,
+    then call it again with confirm=true only after the user has explicitly
+    agreed to delete that specific section.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Name of the section to delete.
+        confirm: Must be explicitly set to true to actually perform the
+            deletion. Defaults to false, which only returns a preview.
+    """
+    section_id = _com_find_section_id(notebook_name, section_name)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available sections."
+        )
+
+    if not confirm:
+        pages = _com_list_pages(section_id)
+        return (
+            f"PREVIEW (nothing deleted yet): this would move section '{section_name}' "
+            f"in notebook '{notebook_name}' ({len(pages)} page(s)) to the OneNote recycle "
+            f"bin. Ask the user to explicitly confirm this exact section before calling "
+            f"again with confirm=true."
+        )
+
+    ok, result = _com_delete_hierarchy(section_id)
+    if ok:
+        return f"Section '{section_name}' deleted (moved to recycle bin)."
+    return f"Failed to delete section '{section_name}': {result}"
+
+
+@mcp.tool()
+async def delete_page(page_id: str, confirm: bool = False) -> str:
+    """Delete a page (moves it to the OneNote recycle bin, not permanent).
+
+    This is a two-step, irreversible-feeling operation: call it once with
+    confirm left as false to get a preview, then call it again with
+    confirm=true only after the user has explicitly agreed to delete that
+    specific page.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        confirm: Must be explicitly set to true to actually perform the
+            deletion. Defaults to false, which only returns a preview.
+    """
+    if not confirm:
+        return (
+            f"PREVIEW (nothing deleted yet): this would move page (ID: {page_id}) to "
+            f"the OneNote recycle bin. Ask the user to explicitly confirm this exact "
+            f"page before calling again with confirm=true."
+        )
+
+    ok, result = _com_delete_hierarchy(page_id)
+    if ok:
+        return "Page deleted (moved to recycle bin)."
+    return f"Failed to delete page: {result}"
+
+
+@mcp.tool()
+async def list_recycle_bin(notebook_name: str) -> str:
+    """List sections and pages currently in a notebook's recycle bin.
+
+    Use this to find the exact name of something to restore with
+    move_section, or to double-check what a delete_section call actually
+    removed.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+    """
+    root = _com_get_hierarchy(4)
+    if root is None:
+        return "Could not connect to OneNote. Make sure the OneNote desktop app is installed."
+
+    lines = []
+    for nb in root.iter(f"{{{ONE_NS}}}Notebook"):
+        if nb.get("name", "").lower() != notebook_name.lower():
+            continue
+        for sec in nb.iter(f"{{{ONE_NS}}}Section"):
+            if sec.get("isInRecycleBin") == "true":
+                lines.append(f"- [section] {sec.get('name', '?')}")
+                continue
+            for page in sec.iter(f"{{{ONE_NS}}}Page"):
+                if page.get("isInRecycleBin") == "true":
+                    lines.append(f"- [page] {page.get('name', '?')}  (in section '{sec.get('name', '?')}', id: {page.get('ID', '')})")
+
+    if not lines:
+        return f"Recycle bin for '{notebook_name}' is empty."
+    return "\n".join(lines)
 
 
 @mcp.tool()

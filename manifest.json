@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "onenote-mcp",
   "display_name": "OneNote (Local)",
-  "version": "1.0.0",
-  "description": "Read and write local Microsoft OneNote notebooks, both from local backups and live via the running OneNote app. No account, API key, or Azure setup needed.",
-  "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks. Reads from OneNote's local backup snapshots for quick browsing and search, and drives the running OneNote desktop app via its COM API for always-current reads plus writing: creating sections and pages, and appending content.\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author -- adding live page/section reading, live section creation, a page-title escaping fix, and language-independent backup detection. Stays open source under the same MIT license.",
+  "version": "1.1.0",
+  "description": "Read, write, and organize local Microsoft OneNote notebooks, both from local backups and live via the running OneNote app. No account, API key, or Azure setup needed.",
+  "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks. Reads from OneNote's local backup snapshots for quick browsing and search, and drives the running OneNote desktop app via its COM API for always-current reads plus writing and organizing: creating, renaming, moving, and deleting sections, section groups, and pages (deletes require explicit confirmation and only move items to the recycle bin).\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author. Stays open source under the same MIT license.",
   "author": {
     "name": "Rail1337"
   },
@@ -33,7 +33,14 @@
     { "name": "list_live_pages", "description": "List pages in a section, with IDs for reading/appending" },
     { "name": "read_live_page", "description": "Read the full text of a single live page" },
     { "name": "read_live_section", "description": "Read every page in a section, live" },
-    { "name": "append_to_page", "description": "Append content to an existing page" }
+    { "name": "append_to_page", "description": "Append content to an existing page" },
+    { "name": "create_section_group", "description": "Create a new section group (folder) in a notebook" },
+    { "name": "move_section", "description": "Move a section to a different section group, or restore one from the recycle bin" },
+    { "name": "rename_section", "description": "Rename an existing section" },
+    { "name": "rename_page", "description": "Rename an existing page's title" },
+    { "name": "delete_section", "description": "Delete a section (recycle bin, requires confirm=true)" },
+    { "name": "delete_page", "description": "Delete a page (recycle bin, requires confirm=true)" },
+    { "name": "list_recycle_bin", "description": "List sections and pages currently in a notebook's recycle bin" }
   ],
   "compatibility": {
     "claude_desktop": ">=0.10.0",

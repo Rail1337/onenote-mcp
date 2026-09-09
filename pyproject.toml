@@ -1,6 +1,6 @@
 [project]
 name = "onenote"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for reading and writing local Microsoft OneNote notebooks (local backups + live COM API)"
 readme = "README.md"
 requires-python = ">=3.12"
