@@ -1,10 +1,11 @@
 [project]
 name = "onenote"
-version = "1.1.0"
+version = "1.2"
 description = "MCP server for reading and writing local Microsoft OneNote notebooks (local backups + live COM API)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.26.0",
     "pyonenote>=0.0.2",
+    "pillow>=10.0.0",
 ]

@@ -2,7 +2,17 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.0] - 2026-09-09
+## [1.2] - 2026-09-09
+
+### Added
+- OCR text extraction — `read_live_page`/`read_live_section` now also surface text OneNote automatically recognizes in embedded images (e.g. a stat block screenshot, a scanned PDF page), clearly labeled since OCR output can contain recognition errors
+- `insert_image_from_file` — insert an image onto a page by local file path; only a path is ever passed to the tool, never the image bytes, keeping large images out of the conversation entirely
+- A bare filename (e.g. `"Background.png"`) can be used instead of a full path if the image is in the default drop folder, which is resolved via Windows' actual configured Downloads location (not just the default `%USERPROFILE%\Downloads`) — this also works correctly if Downloads has been relocated to another drive
+
+### Dependencies
+- Added Pillow (image dimension/format detection)
+
+## [1.1] - 2026-09-09
 
 ### Added
 - `create_section_group` — create a new section group (folder) in a notebook
@@ -15,7 +25,7 @@ All notable changes to this project are documented here.
 ### Changed
 - `list_live_notebooks` now renders the full nested hierarchy (section groups as an indented tree) instead of a flat list of sections
 
-## [1.0.0] - 2026-09-08
+## [1.0] - 2026-09-08
 
 First public release. Fork of [mhzarem/onenote-mcp](https://github.com/mhzarem/onenote-mcp).
 

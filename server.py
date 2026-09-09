@@ -29,7 +29,9 @@ Usage with Claude Code:
     claude mcp add --transport stdio onenote -- uv --directory "path/to/this/project" run server.py
 """
 
+import base64
 import html
+import io
 import logging
 import os
 import re
@@ -41,6 +43,7 @@ from pathlib import Path
 
 from pyOneNote.OneDocument import OneDocment
 from mcp.server.fastmcp import FastMCP
+from PIL import Image as PILImage
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -92,6 +95,54 @@ def _detect_backup_dir() -> Path:
 
 
 ONENOTE_DIR = _detect_backup_dir()
+
+def _get_windows_downloads_folder() -> Path | None:
+    """Ask Windows where the Downloads folder actually is via
+    SHGetKnownFolderPath, instead of assuming the default
+    %USERPROFILE%\\Downloads -- Windows lets users relocate Downloads (and
+    Documents, Pictures, etc.) to another drive entirely via
+    Properties > Location, which Path.home()/"Downloads" can't see."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        # FOLDERID_Downloads -- this GUID has no CSIDL equivalent, it only
+        # exists via the newer SHGetKnownFolderPath API.
+        FOLDERID_Downloads = GUID(
+            0x374DE290, 0x123F, 0x4565,
+            (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
+        )
+
+        path_ptr = ctypes.c_wchar_p()
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(FOLDERID_Downloads), 0, None, ctypes.byref(path_ptr)
+        )
+        if result == 0 and path_ptr.value:
+            path = Path(path_ptr.value)
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+            return path
+    except Exception as e:
+        # Logging isn't configured yet at this point in module load, so this
+        # goes straight to stderr instead of through the `log` object.
+        print(f"Could not resolve the real Downloads folder via Windows: {e}", file=sys.stderr)
+    return None
+
+
+# Default folder to look for images in when insert_image_from_file is given
+# just a filename instead of a full path. Override with ONENOTE_IMAGE_DIR to
+# use a different drop folder.
+IMAGE_DROP_DIR = Path(
+    os.environ.get("ONENOTE_IMAGE_DIR")
+    or str(_get_windows_downloads_folder() or (Path.home() / "Downloads"))
+)
 
 # ---------------------------------------------------------------------------
 # Logging (to stderr so it doesn't break stdio MCP transport)
@@ -564,6 +615,17 @@ def _extract_text_from_page_xml(xml_content: str) -> str:
 
     Text lives in <one:T> elements, often as inline HTML (spans, bold, etc.),
     so tags are stripped and HTML entities unescaped after extraction.
+
+    OneNote also runs OCR on embedded images (e.g. a stat block screenshot,
+    a scanned PDF page) and stores the recognized text in a nested
+    <one:OCRData><one:OCRText> element right next to the <one:Image>. That
+    text is picked up here too -- and clearly labeled, since OCR output can
+    contain recognition errors -- so image content isn't silently invisible
+    to the text-only reading tools.
+
+    Walking root.iter() with no tag filter visits every element in document
+    order, so <one:T> and <one:OCRText> content comes out roughly in the
+    order it appears on the page instead of images being lumped separately.
     """
     try:
         root = ET.fromstring(xml_content)
@@ -571,15 +633,24 @@ def _extract_text_from_page_xml(xml_content: str) -> str:
         log.warning("Failed to parse page content XML: %s", e)
         return ""
 
+    t_tag = f"{{{ONE_NS}}}T"
+    ocr_tag = f"{{{ONE_NS}}}OCRText"
+
     lines = []
-    for t in root.iter(f"{{{ONE_NS}}}T"):
-        raw = t.text or ""
-        if not raw.strip():
-            continue
-        plain = re.sub(r"<[^>]+>", "", raw)
-        plain = html.unescape(plain).strip()
-        if plain:
-            lines.append(plain)
+    for el in root.iter():
+        if el.tag == t_tag:
+            raw = el.text or ""
+            if not raw.strip():
+                continue
+            plain = re.sub(r"<[^>]+>", "", raw)
+            plain = html.unescape(plain).strip()
+            if plain:
+                lines.append(plain)
+        elif el.tag == ocr_tag:
+            raw = el.text or ""
+            plain = html.unescape(raw).strip() if raw else ""
+            if plain:
+                lines.append(f"[OCR text from an image, may contain recognition errors]\n{plain}")
     return "\n".join(lines)
 
 
@@ -951,6 +1022,131 @@ Write-Output "OK"
             os.remove(title_file)
         except OSError:
             pass
+
+
+def _com_insert_image_bytes(page_id: str, raw_bytes: bytes, image_format: str) -> tuple[bool, str]:
+    """Insert an image (given as raw bytes) as a new content block on an
+    existing page, using the OneNote COM API.
+
+    image_format is the file format the bytes are in (e.g. "png", "jpeg",
+    "gif") -- OneNote needs this to know how to decode/render it.
+
+    Without an explicit <one:Size>, OneNote auto-scales inserted images down
+    to a small default (observed: ~250x250), so the image's real pixel
+    dimensions are read via Pillow and set with isSetByUser="true" to stop
+    OneNote from touching the size.
+    """
+    image_base64 = base64.b64encode(raw_bytes).decode("ascii")
+    log.info("insert_image: page=%s, format=%s, bytes=%d", page_id, image_format, len(raw_bytes))
+
+    try:
+        with PILImage.open(io.BytesIO(raw_bytes)) as img:
+            width_px, height_px = img.size
+    except Exception as e:
+        log.warning("insert_image: could not read image dimensions: %s", e)
+        width_px, height_px = None, None
+
+    # Base64 data can be large; write to a temp file to avoid PowerShell
+    # command-line/argument length limits, same as title/body already do.
+    b64_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_image_b64.txt")
+    with open(b64_file, "w", encoding="ascii") as f:
+        f.write(image_base64)
+
+    page_id_esc = page_id.replace("'", "''")
+    format_esc = image_format.replace("'", "''")
+
+    if width_px and height_px:
+        size_line = (
+            f'$size = $xml.CreateElement("one", "Size", "http://schemas.microsoft.com/office/onenote/2013/onenote"); '
+            f'$size.SetAttribute("width", "{width_px}.0"); '
+            f'$size.SetAttribute("height", "{height_px}.0"); '
+            f'$size.SetAttribute("isSetByUser", "true"); '
+            f'$image.AppendChild($size) | Out-Null'
+        )
+    else:
+        size_line = "# image dimensions unknown; letting OneNote pick a size"
+
+    script = f"""
+$imageB64 = Get-Content -Path '{b64_file.replace(chr(39), chr(39)+chr(39))}' -Raw
+if ($imageB64) {{ $imageB64 = $imageB64.Trim() }}
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+
+$outline = $xml.CreateElement("one", "Outline", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeChildren = $xml.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oe = $xml.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$image = $xml.CreateElement("one", "Image", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$image.SetAttribute("format", "{format_esc}")
+{size_line}
+$data = $xml.CreateElement("one", "Data", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$data.InnerText = $imageB64
+$image.AppendChild($data) | Out-Null
+$oe.AppendChild($image) | Out-Null
+$oeChildren.AppendChild($oe) | Out-Null
+$outline.AppendChild($oeChildren) | Out-Null
+$xml.DocumentElement.AppendChild($outline) | Out-Null
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Insert image UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("insert_image result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
+        if ok:
+            return True, "Image inserted successfully."
+        return False, f"Failed to insert image: {output}"
+    finally:
+        try:
+            os.remove(b64_file)
+        except OSError:
+            pass
+
+
+def _com_insert_image_from_file(page_id: str, file_path: str) -> tuple[bool, str]:
+    """Insert an image by reading it from a local file. The OneNote COM API
+    embeds the file's bytes directly -- the caller only ever needs to pass a
+    path, never the image data itself.
+
+    If file_path doesn't exist as given (e.g. it's just a bare filename, not
+    a full path), it's also looked up inside IMAGE_DROP_DIR -- so a user can
+    save "Background.png" wherever that is (Downloads by default) and refer
+    to it by name alone.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        fallback = IMAGE_DROP_DIR / file_path
+        if fallback.is_file():
+            path = fallback
+        else:
+            return False, (
+                f"File not found: {file_path} "
+                f"(also checked {IMAGE_DROP_DIR})"
+            )
+
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as e:
+        return False, f"Could not read file: {e}"
+
+    try:
+        with PILImage.open(io.BytesIO(raw_bytes)) as img:
+            image_format = (img.format or "").lower()
+    except Exception:
+        # Fall back to the file extension if Pillow can't identify it.
+        image_format = path.suffix.lstrip(".").lower()
+
+    if not image_format:
+        return False, f"Could not determine image format for: {file_path}"
+
+    return _com_insert_image_bytes(page_id, raw_bytes, image_format)
 
 
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
@@ -1380,6 +1576,29 @@ async def read_live_section(notebook_name: str, section_name: str) -> str:
         parts.append(f"## {p['name']}\n{text or '(no text content)'}")
 
     return "\n\n".join(parts)
+
+
+@mcp.tool()
+async def insert_image_from_file(page_id: str, file_path: str) -> str:
+    """Insert an image onto an existing page by reading it from a local file.
+
+    Only a path needs to be passed here, never the image data itself, which
+    keeps large images out of the conversation entirely.
+
+    file_path can be a full absolute path, or just a bare filename (e.g.
+    "Background.png") -- a bare filename is looked up in the user's default
+    image drop folder (Downloads, unless overridden), so a user can just
+    save a file there and refer to it by name.
+
+    Requires the OneNote desktop app to be installed.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        file_path: Absolute path to the image file, or just its filename if
+            it's in the default drop folder (png, jpeg, gif, etc.).
+    """
+    ok, msg = _com_insert_image_from_file(page_id, file_path)
+    return msg
 
 
 @mcp.tool()
