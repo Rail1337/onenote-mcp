@@ -43,7 +43,7 @@
     { "name": "list_recycle_bin", "description": "List sections and pages currently in a notebook's recycle bin" },
     { "name": "insert_image_from_file", "description": "Insert an image onto a page from a local file path (or bare filename in the default Downloads folder)" },
     { "name": "find_and_replace_in_page", "description": "Find and replace an exact piece of text within a page" },
-    { "name": "replace_last_block", "description": "Replace the last content block on a page, without needing to know what it said" },
+    { "name": "replace_last_block", "description": "Replace the last content block on a page, without needing to know what it said (requires confirm=true if the page has only one block)" },
     { "name": "get_history_file_path", "description": "Show where the action history log (history.md) actually lives on disk" },
     { "name": "list_recent_actions", "description": "List recently logged actions (creates, renames, moves, replacements, deletes), newest first" },
     { "name": "get_action_detail", "description": "Show the full, unabridged data for one logged action, not just its one-line summary" },

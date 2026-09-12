@@ -1571,23 +1571,28 @@ Write-Output "OK"
             pass
 
 
-def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, str]:
-    """Replace the last <one:OE> content block in a page's BODY with
-    new_content, regardless of what it previously contained. Never
-    touches the page's title, even though the title is structurally also
-    an <one:OE> -- see _iter_body_oe.
+def _com_replace_block_by_id(
+    page_id: str, block_id: str, new_content: str, expected_raw: str | None = None
+) -> tuple[bool, str, str]:
+    """Replace one specific body content block, addressed by its stable
+    objectID rather than by its position in the page.
 
-    "Block" here means one <one:OE> element, OneNote's own unit of content.
-    A page built from a single create_page call (the common case) has
-    exactly one such block holding the *entire* body -- so on a page like
-    that, this replaces the whole page body, not just a trailing sentence
-    or paragraph. It only behaves like "undo what I just wrote" in the
-    narrower sense once the page has multiple blocks (e.g. after one or
-    more append_to_page calls). The returned message says so explicitly
-    when it happens, instead of leaving the caller to infer it.
+    This is the core mutation _com_replace_last_block delegates to (after
+    resolving what "the last block" currently means) -- and what undo/
+    redo of a previous replace_last_block call use directly, since they
+    already know exactly which block was changed and shouldn't
+    re-resolve "the last block" fresh: the page may have grown new
+    blocks since (another append_to_page or replace_last_block call in
+    between), which would otherwise make undo/redo silently act on the
+    wrong block.
 
-    Returns (ok, message, previous_plain_text) -- previous_plain_text is
-    the old block's plain text, captured for undo purposes.
+    expected_raw, when given, is verified against the block's current raw
+    content right before writing (same optimistic-concurrency check
+    find_and_replace_in_page and this function's caller have always done)
+    -- aborts rather than risk overwriting content that changed for an
+    unrelated reason since expected_raw was captured.
+
+    Returns (ok, message, previous_plain_text).
     """
     xml_content = _com_get_page_content(page_id)
     if xml_content is None:
@@ -1597,6 +1602,136 @@ def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, 
         root = ET.fromstring(xml_content)
     except ET.ParseError as e:
         return False, f"Could not parse page XML: {e}", ""
+
+    t_tag = f"{{{ONE_NS}}}T"
+    target_oe = None
+    for oe in _iter_body_oe(root):
+        if oe.get("objectID") == block_id:
+            target_oe = oe
+            break
+    if target_oe is None:
+        return False, f"Could not find a block with ID {block_id} -- it may have been deleted, or the page changed.", ""
+
+    raw_old_text = "".join(c.text or "" for c in list(target_oe) if c.tag == t_tag)
+    old_text = html.unescape(re.sub(r"<[^>]+>", "", raw_old_text))
+    verify_against = raw_old_text if expected_raw is None else expected_raw
+
+    body_html = _escape_cdata(_sanitize_html_for_onenote(new_content))
+    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_block_body.txt")
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(body_html)
+    expected_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_block_expected.txt")
+    # newline="" disables Python's universal-newline translation on write, so
+    # the file holds the exact original bytes -- needed since this is
+    # compared byte-for-byte against the live XML's InnerText below.
+    with open(expected_file, "w", encoding="utf-8", newline="") as f:
+        f.write(verify_against)
+
+    page_id_esc = page_id.replace("'", "''")
+    block_id_esc = block_id.replace("'", "''")
+    script = f"""
+$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
+$expectedRaw = Get-Content -Path '{expected_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($expectedRaw -eq $null) {{ $expectedRaw = "" }}
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$targetOe = $xml.SelectSingleNode("//one:Outline//one:OE[@objectID='{block_id_esc}']", $nsMgr)
+if ($targetOe -eq $null) {{
+    Write-Error "Block {block_id_esc} no longer exists -- aborting, nothing was modified."
+    exit 1
+}}
+$tNodes = @($targetOe.ChildNodes | Where-Object {{ $_.LocalName -eq "T" }})
+$actualRaw = -join ($tNodes | ForEach-Object {{ $_.InnerText }})
+if ($actualRaw -ne $expectedRaw) {{
+    Write-Error "Block content changed since it was read -- aborting, nothing was modified. Please retry."
+    exit 1
+}}
+foreach ($tn in $tNodes) {{ $targetOe.RemoveChild($tn) | Out-Null }}
+$newT = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$cdata = $xml.CreateCDataSection($bodyContent)
+$newT.AppendChild($cdata) | Out-Null
+$targetOe.AppendChild($newT) | Out-Null
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Replace-block-by-id UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("replace_block_by_id: page=%s block=%s ok=%s output=%r",
+                  page_id, block_id, ok, output[:200] if output else "(empty)")
+        if ok:
+            return True, "Block replaced successfully.", old_text
+        return False, f"Failed to replace block: {output}", ""
+    finally:
+        for f in (body_file, expected_file):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def _com_count_body_text_blocks(page_id: str) -> int | None:
+    """Count how many body content blocks (text-bearing <one:OE> elements
+    -- same definition _com_replace_last_block uses for "a block") a page
+    currently has. Returns None if the page couldn't be read.
+
+    Used by the replace_last_block tool's confirmation gate to detect the
+    single-block case -- where "replace the last block" actually means
+    "replace the entire page body" -- before making any change.
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return None
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None
+    t_tag = f"{{{ONE_NS}}}T"
+    return sum(1 for oe in _iter_body_oe(root) if any(c.tag == t_tag for c in list(oe)))
+
+
+def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, str, str]:
+    """Replace the last <one:OE> content block in a page's BODY with
+    new_content, regardless of what it previously contained. Never
+    touches the page's title, even though the title is structurally also
+    an <one:OE> -- see _iter_body_oe.
+
+    "Block" here means one <one:OE> element, OneNote's own unit of content.
+    A page built from a single create_page call (the common case) has
+    exactly one such block holding the *entire* body -- so on a page like
+    that, this replaces the whole page body, not just a trailing sentence
+    or paragraph. The replace_last_block TOOL wrapper is responsible for
+    gating that single-block case behind confirm=true -- this function
+    always performs the replacement it's asked for.
+
+    Resolves "the last block" once here (by position, since that's the
+    only way to define "last"), then delegates the actual write to
+    _com_replace_block_by_id using that block's stable objectID -- so a
+    later undo/redo of this specific call can target the exact same
+    block directly, instead of re-resolving "last" fresh (which could
+    mean a different block after further edits).
+
+    Returns (ok, message, previous_plain_text, block_id).
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return False, "Could not read page content.", "", ""
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        return False, f"Could not parse page XML: {e}", "", ""
 
     t_tag = f"{{{ONE_NS}}}T"
     all_oe = list(_iter_body_oe(root))
@@ -1610,81 +1745,27 @@ def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, 
             last_index = i
             break
     if last_index is None:
-        return False, "This page has no content blocks to replace.", ""
+        return False, "This page has no content blocks to replace.", "", ""
 
     last_oe = all_oe[last_index]
     raw_old_text = "".join(c.text or "" for c in list(last_oe) if c.tag == t_tag)
-    old_text = html.unescape(re.sub(r"<[^>]+>", "", raw_old_text))
     is_only_block = len(all_oe) == 1
+    block_id = last_oe.get("objectID", "")
 
-    body_html = _escape_cdata(_sanitize_html_for_onenote(new_content))
-    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_last_body.txt")
-    with open(body_file, "w", encoding="utf-8") as f:
-        f.write(body_html)
-    expected_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_last_expected.txt")
-    # newline="" disables Python's universal-newline translation on write, so
-    # the file holds the exact original bytes -- needed since this is
-    # compared byte-for-byte against the live XML's InnerText below.
-    with open(expected_file, "w", encoding="utf-8", newline="") as f:
-        f.write(raw_old_text)
+    if not block_id:
+        # Every block a live GetPageContent call returns should carry a
+        # real objectID -- OneNote assigns one the moment content becomes
+        # part of the live page, not just on next explicit save. Bail
+        # out honestly rather than fabricate a way to target it.
+        return False, "This block has no stable ID (unexpected OneNote state) -- cannot safely target it.", "", ""
 
-    page_id_esc = page_id.replace("'", "''")
-    script = f"""
-$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
-if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
-$expectedRaw = Get-Content -Path '{expected_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
-if ($expectedRaw -eq $null) {{ $expectedRaw = "" }}
-
-$onenote = New-Object -ComObject OneNote.Application
-$pageXml = ""
-$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
-$xml = [xml]$pageXml
-$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
-$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$oeNodes = $xml.SelectNodes("//one:Outline//one:OE", $nsMgr)
-$lastOe = $oeNodes[{last_index}]
-if ($lastOe -eq $null) {{
-    Write-Error "Page structure changed since it was read (block no longer exists) -- aborting, nothing was modified."
-    exit 1
-}}
-$tNodes = @($lastOe.ChildNodes | Where-Object {{ $_.LocalName -eq "T" }})
-$actualRaw = -join ($tNodes | ForEach-Object {{ $_.InnerText }})
-if ($actualRaw -ne $expectedRaw) {{
-    Write-Error "Page content changed since it was read -- aborting, nothing was modified. Please retry."
-    exit 1
-}}
-foreach ($tn in $tNodes) {{ $lastOe.RemoveChild($tn) | Out-Null }}
-$newT = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$cdata = $xml.CreateCDataSection($bodyContent)
-$newT.AppendChild($cdata) | Out-Null
-$lastOe.AppendChild($newT) | Out-Null
-
-try {{
-    $onenote.UpdatePageContent($xml.OuterXml)
-}} catch {{
-    Write-Error "Replace-last-block UpdatePageContent failed: $_"
-    exit 1
-}}
-Write-Output "OK"
-"""
-    try:
-        ok, output = _run_powershell_file(script)
-        log.info("replace_last_block: page=%s ok=%s output=%r", page_id, ok, output[:200] if output else "(empty)")
-        if ok:
-            msg = "Last block replaced successfully."
-            if is_only_block:
-                msg += (
-                    " Note: this page had only one content block, so this "
-                    "replaced the entire page body, not just a trailing part of it."
-                )
-            return True, msg, old_text
-        return False, f"Failed to replace last block: {output}", ""
-    finally:
-        for f in (body_file, expected_file):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+    ok, msg, old_text = _com_replace_block_by_id(page_id, block_id, new_content, expected_raw=raw_old_text)
+    if ok and is_only_block:
+        msg += (
+            " Note: this page had only one content block, so this "
+            "replaced the entire page body, not just a trailing part of it."
+        )
+    return ok, msg, old_text, block_id
 
 
 def _com_delete_page_content_object(page_id: str, object_id: str) -> tuple[bool, str]:
@@ -2313,7 +2394,7 @@ async def append_to_page(page_id: str, content: str) -> str:
 
 
 @mcp.tool()
-async def replace_last_block(page_id: str, new_content: str) -> str:
+async def replace_last_block(page_id: str, new_content: str, confirm: bool = False) -> str:
     """Replace the last content block on a page with new_content, without
     needing to know or repeat what it currently says.
 
@@ -2323,24 +2404,40 @@ async def replace_last_block(page_id: str, new_content: str) -> str:
     something older or deeper in a page, use find_and_replace_in_page
     instead.
 
-    Caution on pages built from a single create_page call: that call puts
-    the entire body into one single block, so there "the last block" IS
-    the whole page body -- this will replace everything, not just a
-    trailing sentence. The returned message says so explicitly when it
-    happens. If you only want to change part of such a page, use
-    find_and_replace_in_page instead.
+    Pages built from a single create_page call put the entire body into
+    one single block, so there "the last block" IS the whole page body --
+    this would replace everything, not just a trailing sentence. That
+    case is treated as an irreversible-feeling operation the same way
+    delete_section/delete_page are: call once with confirm left as false
+    to get a preview, then again with confirm=true only after the user
+    has explicitly agreed to replace this page's entire content. On a
+    page with more than one block, no confirmation is needed -- only the
+    last, narrower block is ever affected there.
 
     Args:
         page_id: The page ID (from list_live_pages).
         new_content: The new content for that block (plain text or HTML).
+        confirm: Only checked when the page turns out to have just one
+            content block. Defaults to false, which returns a preview
+            (and changes nothing) in that case.
     """
-    ok, msg, old_text = _com_replace_last_block(page_id, new_content)
+    if not confirm:
+        block_count = _com_count_body_text_blocks(page_id)
+        if block_count == 1:
+            return (
+                "PREVIEW (nothing replaced yet): this page has only one content "
+                "block, so replace_last_block would overwrite its ENTIRE body, "
+                "not just a trailing part of it. Ask the user to explicitly "
+                "confirm that before calling again with confirm=true."
+            )
+
+    ok, msg, old_text, block_id = _com_replace_last_block(page_id, new_content)
     if ok:
         _log_action(
             f"replace_last_block | page_id={page_id} | replaced the last block",
             {
                 "type": "replace_last_block", "page_id": page_id,
-                "old_text": old_text, "new_text": new_content,
+                "old_text": old_text, "new_text": new_content, "block_id": block_id,
             },
         )
     return msg
@@ -2412,7 +2509,16 @@ def _reverse_logged_action(undo_data: dict) -> tuple[bool, str]:
         return ok, msg
 
     if action_type == "replace_last_block":
-        ok, msg, _ = _com_replace_last_block(undo_data["page_id"], undo_data["old_text"])
+        block_id = undo_data.get("block_id")
+        if block_id:
+            # Targets the exact block this action changed, immune to the
+            # page having grown new blocks since (see _com_replace_block_by_id).
+            ok, msg, _ = _com_replace_block_by_id(undo_data["page_id"], block_id, undo_data["old_text"])
+            return ok, msg
+        # Fallback for entries logged before block-ID tracking existed --
+        # re-resolves "the last block" fresh, same imprecision this
+        # always had before today's fix, not made any worse.
+        ok, msg, _, _ = _com_replace_last_block(undo_data["page_id"], undo_data["old_text"])
         return ok, msg
 
     if action_type == "append_to_page":
@@ -2671,7 +2777,11 @@ def _apply_logged_action(data: dict) -> tuple[bool, str, dict]:
     if action_type == "replace_last_block":
         if "new_text" not in data:
             return False, "This entry predates redo support (no new content recorded) -- redo it by hand.", {}
-        ok, msg, _ = _com_replace_last_block(data["page_id"], data["new_text"])
+        block_id = data.get("block_id")
+        if block_id:
+            ok, msg, _ = _com_replace_block_by_id(data["page_id"], block_id, data["new_text"])
+            return ok, msg, {}
+        ok, msg, _, _ = _com_replace_last_block(data["page_id"], data["new_text"])
         return ok, msg, {}
 
     if action_type == "append_to_page":
