@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "onenote-mcp",
   "display_name": "OneNote (Local)",
-  "version": "1.2",
+  "version": "1.3",
   "description": "Read, write, and organize local Microsoft OneNote notebooks (Windows only), both from local backups and live via the running OneNote app. No account, API key, or Azure setup needed.",
   "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks on Windows. Reads from OneNote's local backup snapshots for quick browsing and search (including OCR text from embedded images), and drives the running OneNote desktop app via its COM API for always-current reads plus writing and organizing: creating, renaming, moving, and deleting sections, section groups, and pages (deletes require explicit confirmation and only move items to the recycle bin), and inserting images from a local file path.\n\nAlso edits existing pages directly -- find/replace exact text, or replace the last content block -- with undo and redo backed by a persistent action log (history.md) that survives restarts, so a mistaken edit can be reversed (and a mistaken undo redone) without digging through OneNote's own recycle bin by hand.\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author. Stays open source under the same MIT license.",
   "author": {
