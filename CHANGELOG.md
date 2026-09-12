@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ## [1.3] - 2026-09-12
 
-This batch wore me out more than I expected. What started as "let me add a find-and-replace tool" turned into a full day of chasing undo/redo edge cases across every write tool in here. `insert_block_after` in particular fought me through two separate failed attempts before I found the actual root cause — turns out OneNote's own stored line-break format doesn't match what this server writes itself, so my first two fixes both looked right and both weren't. Good to finally have it all working and tested against a real page, not just synthetic ones.
+This batch wore me out more than I expected. What started as "let me add a find-and-replace tool" turned into a full day of chasing undo/redo edge cases across every write tool in here. `insert_block_after` in particular fought me through two separate failed attempts before I found the actual root cause — turns out OneNote's own stored line-break format doesn't match what this server writes itself, so my first two fixes both looked right and both weren't. Good to finally have it all working and tested. I think it's in a good shape now that satisfies me.
 
 ### Added
 - `find_and_replace_in_page` — find and replace exact text within a page
