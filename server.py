@@ -1917,8 +1917,8 @@ def _splice_paragraph_after(
     a real page (confirmed by dumping one) is "<br />" (with a space)
     immediately followed by a literal newline, which a "<br/>"-only
     pattern silently matches zero times, treating the entire block as one
-    giant unsplit paragraph. That was the actual bug behind Alex's first
-    real test: no split points found meant the anchor "matched" the
+    giant unsplit paragraph. That was the actual bug behind the first
+    real-page test: no split points found meant the anchor "matched" the
     single whole-block segment, and insertion landed at the very end of
     it -- the end of the page -- regardless of where anchor_text was.
 

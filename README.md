@@ -27,6 +27,13 @@ This started as [mhzarem/onenote-mcp](https://github.com/mhzarem/onenote-mcp), a
 | Compatibility | Backup-folder detection | The local backup folder is auto-detected regardless of Windows/Office display language, instead of assuming the English name "Backup" |
 | Compatibility | Real Downloads-folder detection | Resolves Windows' actual configured Downloads location (via `SHGetKnownFolderPath`), so filename-only image lookups work even if Downloads was relocated to another drive |
 | Distribution | `.mcpb` packaging | Packaged as a self-contained bundle for one-click installation in Claude Desktop |
+| Writing | `find_and_replace_in_page` | Find and replace exact text within a page |
+| Writing | `replace_last_block` | Replace the last content block on a page, without needing to know what it said — requires confirmation if the page has only one block |
+| Writing | `insert_block_after` | Insert a new paragraph right after existing text elsewhere on the page, not just at the end |
+| Undo/Redo | `undo_last_action` / `redo_last_action` | Undo the most recent change, or redo the most recently undone one — backed by a persistent history log that survives restarts |
+| Undo/Redo | `list_recent_actions` / `get_action_detail` | See recent changes, or the full detail behind one of them |
+| Undo/Redo | `get_history_file_path` | Look up where the action history log lives on disk |
+| Reading | `list_drop_folder_images` | List image files available in the default image drop folder |
 
 See [CHANGELOG.md](CHANGELOG.md) for the version-by-version history.
 

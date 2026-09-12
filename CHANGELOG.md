@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.3] - 2026-09-12
+
+This batch wore me out more than I expected. What started as "let me add a find-and-replace tool" turned into a full day of chasing undo/redo edge cases across every write tool in here. `insert_block_after` in particular fought me through two separate failed attempts before I found the actual root cause — turns out OneNote's own stored line-break format doesn't match what this server writes itself, so my first two fixes both looked right and both weren't. Good to finally have it all working and tested against a real page, not just synthetic ones.
+
+### Added
+- `find_and_replace_in_page` — find and replace exact text within a page
+- `replace_last_block` — replace the last content block on a page, without needing to know or repeat what it currently says; requires `confirm=true` if the page has only one block, since that means replacing the entire body
+- `insert_block_after` — insert a new paragraph immediately after existing text elsewhere on the page, not just at the end
+- `undo_last_action` / `redo_last_action` — undo the most recent logged action, or redo the most recently undone one, backed by a persistent history log (`history.md`) that survives restarts
+- `list_recent_actions` / `get_action_detail` — see what's changed recently, or the full detail behind one specific change
+- `get_history_file_path` — look up where the action history log actually lives on disk
+- `list_drop_folder_images` — list image files available in the default image drop folder
+
+### Fixed
+- Various debugging
+
 ## [1.2] - 2026-09-09
 
 ### Added
