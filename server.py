@@ -21,7 +21,8 @@ It exposes tools for Claude to:
     recycle bin, never permanent)
     - Find/replace text on a page, replace its last block, or append to it
     - List recent actions, undo the last one, and redo the last undo --
-    backed by a persistent history.md log that survives restarts
+    backed by a persistent history.md log that survives restarts (its
+    on-disk path can be looked up directly, to read or archive-check it)
     - Insert an image from a local file, and list what's in the drop folder
 
 Prerequisites:
@@ -44,7 +45,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from pyOneNote.OneDocument import OneDocment
@@ -161,6 +162,18 @@ HISTORY_ARCHIVE_FILE = Path(__file__).resolve().parent / "history.archive.md"
 HISTORY_LIMIT = 500
 
 
+def _local_timestamp() -> str:
+    """Return the current time as an ISO-ish string in the machine's own
+    local timezone (e.g. Europe/Berlin), not UTC -- datetime.now() with no
+    tzinfo argument already reads the system clock as local wall-clock
+    time, so no conversion is needed. history.md is personal, read
+    directly by the user, not a cross-timezone API log, so showing the
+    time they'd actually see on their own clock is the right default. No
+    "Z" suffix, since that specifically denotes UTC and would be wrong here.
+    """
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _log_action(summary: str, undo_data: dict) -> None:
     """Append one entry to history.md, then rotate the oldest entries into
     history.archive.md if the active log has grown past HISTORY_LIMIT.
@@ -175,8 +188,7 @@ def _log_action(summary: str, undo_data: dict) -> None:
     readable text if you open the file directly; list_recent_actions
     re-renders it nicely rather than dumping the raw JSON.
     """
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry = {"timestamp": timestamp, "summary": summary, "undone": False, **undo_data}
+    entry = {"timestamp": _local_timestamp(), "summary": summary, "undone": False, **undo_data}
     line = f"- {json.dumps(entry)}\n"
     try:
         is_new = not HISTORY_FILE.exists()
@@ -312,7 +324,7 @@ def _set_action_undone_flag(target_raw_line: str, undone: bool) -> bool:
                 return False
             entry["undone"] = undone
             if undone:
-                entry["undone_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                entry["undone_at"] = _local_timestamp()
             lines[i] = f"- {json.dumps(entry)}\n"
             try:
                 HISTORY_FILE.write_text("".join(lines), encoding="utf-8")
@@ -2366,6 +2378,27 @@ def _reverse_logged_action(undo_data: dict) -> tuple[bool, str]:
         )
 
     return False, f"Unknown action type in log: {action_type!r}"
+
+
+@mcp.tool()
+async def get_history_file_path() -> str:
+    """Return where the action history log actually lives on disk.
+
+    list_recent_actions only shows a limited, reformatted view -- use this
+    when you (or the user) want to open history.md directly, e.g. to read
+    the full log in a text editor, or to check history.archive.md for
+    older entries that have rotated out of the active log.
+    """
+    lines = [f"Active log: {HISTORY_FILE}"]
+    if HISTORY_FILE.exists():
+        lines.append(f"  ({len(_read_history_entries())} entries)")
+    else:
+        lines.append("  (doesn't exist yet -- no actions logged so far)")
+    lines.append(f"Archive (older, rotated-out entries): {HISTORY_ARCHIVE_FILE}")
+    lines.append(
+        "  (exists)" if HISTORY_ARCHIVE_FILE.exists() else "  (doesn't exist yet)"
+    )
+    return "\n".join(lines)
 
 
 @mcp.tool()
