@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -188,7 +189,14 @@ def _log_action(summary: str, undo_data: dict) -> None:
     readable text if you open the file directly; list_recent_actions
     re-renders it nicely rather than dumping the raw JSON.
     """
-    entry = {"timestamp": _local_timestamp(), "summary": summary, "undone": False, **undo_data}
+    # _id disambiguates entries for _set_action_undone_flag's lookup --
+    # _local_timestamp() only has second precision for readability, so two
+    # calls with identical type/fields within the same second produce
+    # byte-identical JSON lines; matching by line content alone would then
+    # hit whichever occurrence comes first in the file, not the specific
+    # one undo/redo actually meant. time.time_ns() effectively never
+    # collides.
+    entry = {"timestamp": _local_timestamp(), "_id": time.time_ns(), "summary": summary, "undone": False, **undo_data}
     line = f"- {json.dumps(entry)}\n"
     try:
         is_new = not HISTORY_FILE.exists()
@@ -245,20 +253,21 @@ def _parse_history_line(line: str) -> dict:
     """Parse one history entry line (a "- " prefix followed by one JSON
     object) into its timestamp, human summary, undo data, and whether it's
     already marked undone."""
-    meta_keys = ("timestamp", "summary", "undone", "undone_at")
+    meta_keys = ("timestamp", "_id", "summary", "undone", "undone_at")
     json_part = line[2:] if line.startswith("- ") else line
     try:
         entry = json.loads(json_part)
     except json.JSONDecodeError as e:
         log.warning("Could not parse history line as JSON: %s", e)
         return {
-            "timestamp": "", "summary": line.strip(), "undo_data": {},
+            "timestamp": "", "id": None, "summary": line.strip(), "undo_data": {},
             "undone": False, "undone_at": None, "raw": line,
         }
 
     undo_data = {k: v for k, v in entry.items() if k not in meta_keys}
     return {
         "timestamp": entry.get("timestamp", ""),
+        "id": entry.get("_id"),
         "summary": entry.get("summary", ""),
         "undo_data": undo_data,
         "undone": bool(entry.get("undone", False)),
@@ -300,13 +309,24 @@ def _find_last_redoable_action() -> dict | None:
     return candidates[-1]
 
 
-def _set_action_undone_flag(target_raw_line: str, undone: bool, extra: dict | None = None) -> bool:
-    """Rewrite history.md, setting the JSON entry matching target_raw_line
-    (matched by exact line content, which is unique since every entry
-    carries its own timestamp) to undone=True (recording when, for
-    _find_last_redoable_action) or back to undone=False (on redo, so the
-    entry becomes undoable again -- toggling back and forth repeatedly is
-    intentional, there's no separate "redone" state).
+def _set_action_undone_flag(
+    entry_id, fallback_raw_line: str, undone: bool, extra: dict | None = None
+) -> bool:
+    """Rewrite history.md, setting the matching entry's undone flag to
+    True (recording when, for _find_last_redoable_action) or back to
+    False (on redo, so the entry becomes undoable again -- toggling back
+    and forth repeatedly is intentional, there's no separate "redone"
+    state).
+
+    Matches primarily by the entry's unique _id (see _log_action) --
+    immune to two entries having byte-identical content within the same
+    second, which exact-line matching alone is not (_local_timestamp()
+    only has second precision, so e.g. two automated find_and_replace
+    calls with the same arguments one after another would otherwise be
+    indistinguishable, and the wrong one could get flagged). entry_id is
+    None for entries logged before _id existed; for those, falls back to
+    matching by exact raw line content via fallback_raw_line -- the same
+    ambiguity risk older entries always had, not made any worse.
 
     extra, when given, is merged into the entry at the same time -- used
     by redo_last_action to refresh an entry's object_id/outline_id after
@@ -320,25 +340,29 @@ def _set_action_undone_flag(target_raw_line: str, undone: bool, extra: dict | No
 
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
-        if line.rstrip("\n") == target_raw_line:
-            json_part = target_raw_line[2:] if target_raw_line.startswith("- ") else target_raw_line
-            try:
-                entry = json.loads(json_part)
-            except json.JSONDecodeError as e:
-                log.warning("Could not parse history entry to update its undone flag: %s", e)
-                return False
-            entry["undone"] = undone
-            if undone:
-                entry["undone_at"] = _local_timestamp()
-            if extra:
-                entry.update(extra)
-            lines[i] = f"- {json.dumps(entry)}\n"
-            try:
-                HISTORY_FILE.write_text("".join(lines), encoding="utf-8")
-            except OSError as e:
-                log.warning("Could not update history log: %s", e)
-                return False
-            return True
+        raw = line.rstrip("\n")
+        json_part = raw[2:] if raw.startswith("- ") else raw
+        try:
+            entry = json.loads(json_part)
+        except json.JSONDecodeError:
+            continue
+
+        matches = (entry.get("_id") == entry_id) if entry_id is not None else (raw == fallback_raw_line)
+        if not matches:
+            continue
+
+        entry["undone"] = undone
+        if undone:
+            entry["undone_at"] = _local_timestamp()
+        if extra:
+            entry.update(extra)
+        lines[i] = f"- {json.dumps(entry)}\n"
+        try:
+            HISTORY_FILE.write_text("".join(lines), encoding="utf-8")
+        except OSError as e:
+            log.warning("Could not update history log: %s", e)
+            return False
+        return True
     return False
 
 # ---------------------------------------------------------------------------
@@ -686,6 +710,24 @@ async def get_notebook_summary(notebook_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+
+
+def _iter_body_oe(root: ET.Element):
+    """Yield every <one:OE> element that's part of the page BODY (nested
+    inside an <one:Outline>), in document order.
+
+    A page's <one:Title> is ALSO structured as <one:Title><one:OE><one:T>,
+    so a plain root.iter("{ns}OE") walk -- which matches the tag anywhere
+    in the tree -- picks up the title's OE too, and since Title comes
+    before every body Outline in document order, it's whichever OE a
+    plain walk finds *first*. find_and_replace_in_page and
+    replace_last_block both need "every content block a user would call
+    a block", which does not include the title -- this is the one place
+    that distinction gets made, so both callers get it for free instead
+    of each needing to know to filter Title out themselves.
+    """
+    for outline in root.iter(f"{{{ONE_NS}}}Outline"):
+        yield from outline.iter(f"{{{ONE_NS}}}OE")
 
 
 def _sanitize_html_for_onenote(html: str) -> str:
@@ -1401,7 +1443,8 @@ def _com_insert_image_from_file(page_id: str, file_path: str) -> tuple[bool, str
 def _com_find_and_replace_in_page(
     page_id: str, find_text: str, replace_text: str, replace_all: bool = False
 ) -> tuple[bool, str, int]:
-    """Find and replace text within a page.
+    """Find and replace text within a page's BODY -- never its title, see
+    _iter_body_oe.
 
     Matches against each <one:OE> content block's whole plain text (its
     direct <one:T> runs joined together first), so a match split across
@@ -1426,12 +1469,11 @@ def _com_find_and_replace_in_page(
         return False, f"Could not parse page XML: {e}", 0
 
     t_tag = f"{{{ONE_NS}}}T"
-    oe_tag = f"{{{ONE_NS}}}OE"
 
     targets = []
     total = 0
     oe_index = -1
-    for oe in root.iter(oe_tag):
+    for oe in _iter_body_oe(root):
         oe_index += 1
         t_children = [c for c in list(oe) if c.tag == t_tag]
         if not t_children:
@@ -1476,7 +1518,7 @@ $onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
 $xml = [xml]$pageXml
 $nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
 $nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$oeNodes = $xml.SelectNodes("//one:OE", $nsMgr)
+$oeNodes = $xml.SelectNodes("//one:Outline//one:OE", $nsMgr)
 
 # Verify every target still has the exact content it had when Python
 # analyzed the page, before changing anything. GetPageContent is called
@@ -1530,8 +1572,10 @@ Write-Output "OK"
 
 
 def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, str]:
-    """Replace the last <one:OE> content block on a page with new_content,
-    regardless of what it previously contained.
+    """Replace the last <one:OE> content block in a page's BODY with
+    new_content, regardless of what it previously contained. Never
+    touches the page's title, even though the title is structurally also
+    an <one:OE> -- see _iter_body_oe.
 
     "Block" here means one <one:OE> element, OneNote's own unit of content.
     A page built from a single create_page call (the common case) has
@@ -1555,8 +1599,7 @@ def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, 
         return False, f"Could not parse page XML: {e}", ""
 
     t_tag = f"{{{ONE_NS}}}T"
-    oe_tag = f"{{{ONE_NS}}}OE"
-    all_oe = list(root.iter(oe_tag))
+    all_oe = list(_iter_body_oe(root))
 
     # "Last block" means the last OE that actually has text in it -- a
     # trailing image-only OE (e.g. from insert_image_from_file) shouldn't
@@ -1598,7 +1641,7 @@ $onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
 $xml = [xml]$pageXml
 $nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
 $nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$oeNodes = $xml.SelectNodes("//one:OE", $nsMgr)
+$oeNodes = $xml.SelectNodes("//one:Outline//one:OE", $nsMgr)
 $lastOe = $oeNodes[{last_index}]
 if ($lastOe -eq $null) {{
     Write-Error "Page structure changed since it was read (block no longer exists) -- aborting, nothing was modified."
@@ -1637,10 +1680,11 @@ Write-Output "OK"
             return True, msg, old_text
         return False, f"Failed to replace last block: {output}", ""
     finally:
-        try:
-            os.remove(body_file)
-        except OSError:
-            pass
+        for f in (body_file, expected_file):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def _com_delete_page_content_object(page_id: str, object_id: str) -> tuple[bool, str]:
@@ -2530,7 +2574,7 @@ async def undo_last_action() -> str:
 
     ok, msg = _reverse_logged_action(last["undo_data"])
     if ok:
-        _set_action_undone_flag(last["raw"], True)
+        _set_action_undone_flag(last["id"], last["raw"], True)
         return f"Undid: {last['timestamp']} | {last['summary']}. ({msg})"
     return f"Could not undo '{last['timestamp']} | {last['summary']}': {msg}"
 
@@ -2601,11 +2645,18 @@ def _apply_logged_action(data: dict) -> tuple[bool, str, dict]:
         if "section_id" not in data or "title" not in data or "content" not in data:
             return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand.", {}
         ok, msg = _com_create_page(data["section_id"], data["title"], data["content"])
-        if ok:
-            id_match = re.search(r"\(ID: (.+)\)$", msg)
-            if id_match:
-                return True, msg, {"object_id": id_match.group(1)}
-        return ok, msg, {}
+        if not ok:
+            return False, msg, {}
+        id_match = re.search(r"\(ID: (.+)\)$", msg)
+        if not id_match:
+            # The page WAS created -- ok is True -- but its new ID
+            # couldn't be scraped back out of the success message, so
+            # don't claim {"object_id": ...} in updates: that would leave
+            # the entry's stale, already-deleted original ID in place
+            # silently, same failure mode as append_to_page's outline_id
+            # capture above. Surface it instead of hiding it.
+            return True, f"{msg} (could not confirm the new page's exact ID -- a later undo of this entry may not target it)", {}
+        return True, msg, {"object_id": id_match.group(1)}
 
     if action_type == "find_and_replace_in_page":
         # Already fully bidirectional from the start -- old_text/new_text
@@ -2627,9 +2678,22 @@ def _apply_logged_action(data: dict) -> tuple[bool, str, dict]:
         if "content" not in data:
             return False, "This entry predates redo support (no content recorded) -- redo it by hand.", {}
         ok, msg, new_outline_id = _com_append_to_page(data["page_id"], data["content"])
-        if ok:
-            return True, msg, {"outline_id": new_outline_id}
-        return False, msg, {}
+        if not ok:
+            return False, msg, {}
+        if not new_outline_id:
+            # The append itself succeeded, but _com_append_to_page's own
+            # follow-up fetch to read back the new block's ID came up
+            # empty (a transient COM/fetch hiccup, not a failed append).
+            # Don't let that empty value overwrite whatever ID was
+            # already on this entry -- entry.update(extra) would clobber
+            # a perfectly good, specific outline_id with "", and a later
+            # undo of THIS entry would then fall back to "delete whatever
+            # is currently last on the page" instead of a known ID --
+            # unsafe if anything else got appended in between. Keeping
+            # the stale ID means that fallback undo instead fails loudly
+            # against a nonexistent ID, which is the safe failure mode.
+            return True, f"{msg} (could not confirm the new block's exact ID -- a later undo of this entry may not target it precisely)", {}
+        return True, msg, {"outline_id": new_outline_id}
 
     if action_type in ("delete_page", "insert_image_from_file"):
         return False, f"'{action_type}' was never undone in the first place, so there's nothing to redo.", {}
@@ -2656,7 +2720,7 @@ async def redo_last_action() -> str:
 
     ok, msg, updates = _apply_logged_action(last["undo_data"])
     if ok:
-        _set_action_undone_flag(last["raw"], False, extra=updates)
+        _set_action_undone_flag(last["id"], last["raw"], False, extra=updates)
         return f"Redid: {last['timestamp']} | {last['summary']}. ({msg})"
     return f"Could not redo '{last['timestamp']} | {last['summary']}': {msg}"
 
