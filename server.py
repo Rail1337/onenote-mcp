@@ -1900,6 +1900,169 @@ Write-Output "OK"
     return True, "Content appended successfully.", new_outline_id
 
 
+def _com_insert_outline_after_id(
+    page_id: str, anchor_outline_id: str, new_content: str
+) -> tuple[bool, str, str]:
+    """Insert new_content as a new <one:Outline> block immediately after
+    the existing outline identified by anchor_outline_id.
+
+    This is the core mutation _com_insert_block_after delegates to (after
+    resolving which outline anchor_text identifies) -- and what redo of a
+    previous insert_block_after call uses directly, so a later redo lands
+    in the same spot even if anchor_text would no longer uniquely (or at
+    all) identify the original anchor block by then.
+
+    Returns (ok, message, new_outline_id) -- new_outline_id is the
+    objectID of the freshly-created block, captured via a follow-up
+    GetPageContent call right after the insert succeeds, same as
+    _com_append_to_page does for its own new block.
+    """
+    body_html = _sanitize_html_for_onenote(new_content)
+    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_insert_after_body.txt")
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(body_html)
+
+    page_id_esc = page_id.replace("'", "''")
+    anchor_id_esc = anchor_outline_id.replace("'", "''")
+
+    script = f"""
+$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$anchorOutline = $xml.SelectSingleNode("//one:Outline[@objectID='{anchor_id_esc}']", $nsMgr)
+if ($anchorOutline -eq $null) {{
+    Write-Error "Anchor block {anchor_id_esc} no longer exists -- aborting, nothing was modified."
+    exit 1
+}}
+
+$outline = $xml.CreateElement("one", "Outline", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeChildren = $xml.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oe = $xml.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$t = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$cdata = $xml.CreateCDataSection($bodyContent)
+$t.AppendChild($cdata) | Out-Null
+$oe.AppendChild($t) | Out-Null
+$oeChildren.AppendChild($oe) | Out-Null
+$outline.AppendChild($oeChildren) | Out-Null
+$anchorOutline.ParentNode.InsertAfter($outline, $anchorOutline) | Out-Null
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Insert-block-after UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("insert_outline_after_id: page=%s anchor=%s ok=%s output=%r",
+                  page_id, anchor_outline_id, ok, output[:200] if output else "(empty)")
+        if not ok:
+            return False, f"Failed to insert block: {output}", ""
+    finally:
+        try:
+            os.remove(body_file)
+        except OSError:
+            pass
+
+    # The newly-inserted Outline sits right after the anchor in document
+    # order -- refetch and look for whichever Outline immediately follows
+    # anchor_outline_id among the page's top-level children, rather than
+    # assuming "last" (it isn't, unless the anchor happened to be the
+    # previous last block).
+    new_outline_id = ""
+    fresh_xml = _com_get_page_content(page_id)
+    if fresh_xml:
+        try:
+            fresh_root = ET.fromstring(fresh_xml)
+            outline_tag = f"{{{ONE_NS}}}Outline"
+            top_level = list(fresh_root)
+            for i, child in enumerate(top_level):
+                if child.tag == outline_tag and child.get("objectID") == anchor_outline_id:
+                    if i + 1 < len(top_level) and top_level[i + 1].tag == outline_tag:
+                        new_outline_id = top_level[i + 1].get("objectID", "")
+                    break
+        except ET.ParseError as e:
+            log.warning("insert_outline_after_id: could not re-parse page to capture new block ID: %s", e)
+
+    return True, "Block inserted successfully.", new_outline_id
+
+
+def _com_insert_block_after(
+    page_id: str, anchor_text: str, new_content: str
+) -> tuple[bool, str, str, str]:
+    """Insert new_content as a new content block immediately after the
+    existing BODY block whose text contains anchor_text -- for putting
+    something in a specific place partway through a page, not at the end
+    (append_to_page) and not by replacing something already there
+    (replace_last_block/find_and_replace_in_page). Never matches inside
+    the page's title (Title isn't an <one:Outline>, so root.iter() over
+    Outline elements never reaches it).
+
+    anchor_text must match exactly (case-sensitive, no fuzzy matching),
+    same contract as find_and_replace_in_page -- if it matches more than
+    one block, or none at all, that's reported honestly rather than
+    guessed at.
+
+    Resolves which outline anchor_text identifies once here, then
+    delegates the actual insert to _com_insert_outline_after_id using
+    that outline's stable objectID.
+
+    Returns (ok, message, new_outline_id, anchor_outline_id).
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return False, "Could not read page content.", "", ""
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        return False, f"Could not parse page XML: {e}", "", ""
+
+    t_tag = f"{{{ONE_NS}}}T"
+    outline_tag = f"{{{ONE_NS}}}Outline"
+
+    # Title is deliberately excluded: it's never an <one:Outline>, only
+    # body Outlines are walked here.
+    matching_outline_ids = []
+    for outline in root.iter(outline_tag):
+        for oe in outline.iter(f"{{{ONE_NS}}}OE"):
+            t_children = [c for c in list(oe) if c.tag == t_tag]
+            if not t_children:
+                continue
+            raw_joined = "".join(t.text or "" for t in t_children)
+            joined = html.unescape(re.sub(r"<[^>]+>", "", raw_joined))
+            if anchor_text in joined:
+                matching_outline_ids.append(outline.get("objectID", ""))
+                break  # one match is enough to identify this outline
+
+    if not matching_outline_ids:
+        return False, (
+            f"No block found containing {anchor_text!r}. Call read_live_page "
+            f"first to find the exact wording."
+        ), "", ""
+    if len(matching_outline_ids) > 1:
+        return False, (
+            f"Found {len(matching_outline_ids)} different blocks containing "
+            f"{anchor_text!r} -- ambiguous. Use more specific anchor_text that "
+            f"uniquely identifies one block."
+        ), "", ""
+
+    anchor_outline_id = matching_outline_ids[0]
+    if not anchor_outline_id:
+        return False, "The matching block has no stable ID (unexpected OneNote state) -- cannot safely target it.", "", ""
+
+    ok, msg, new_outline_id = _com_insert_outline_after_id(page_id, anchor_outline_id, new_content)
+    return ok, msg, new_outline_id, anchor_outline_id
+
+
 def _com_list_pages(section_id: str) -> list[dict]:
     """List pages in a section via COM API. Returns list of {id, name}."""
     root = _com_get_hierarchy(4)
@@ -2399,6 +2562,44 @@ async def append_to_page(page_id: str, content: str) -> str:
 
 
 @mcp.tool()
+async def insert_block_after(page_id: str, anchor_text: str, new_content: str) -> str:
+    """Insert new_content as a new content block immediately after the
+    existing block whose text contains anchor_text.
+
+    Use this for putting something in a specific place partway through a
+    page -- e.g. "add this paragraph right after the one about X". For
+    adding to the very end of the page, use append_to_page instead; for
+    changing something that's already there, use replace_last_block or
+    find_and_replace_in_page.
+
+    anchor_text must match exactly (case-sensitive, no fuzzy/approximate
+    matching), same contract as find_and_replace_in_page -- if in doubt,
+    call read_live_page first to see the exact current wording, then pass
+    back the exact text you found there. If anchor_text matches more than
+    one block on the page, or none, this is reported honestly rather than
+    guessed at -- narrow it down to something that uniquely identifies
+    one block first.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        anchor_text: Exact text identifying which existing block the new
+            content should be inserted after.
+        new_content: The content for the new block (plain text or HTML).
+    """
+    ok, msg, new_outline_id, anchor_outline_id = _com_insert_block_after(page_id, anchor_text, new_content)
+    if ok:
+        _log_action(
+            f"insert_block_after | page_id={page_id} | inserted a new block after \"{anchor_text}\"",
+            {
+                "type": "insert_block_after", "page_id": page_id,
+                "outline_id": new_outline_id, "anchor_outline_id": anchor_outline_id,
+                "content": new_content, "anchor_text": anchor_text,
+            },
+        )
+    return msg
+
+
+@mcp.tool()
 async def replace_last_block(page_id: str, new_content: str, confirm: bool = False) -> str:
     """Replace the last content block on a page with new_content, without
     needing to know or repeat what it currently says.
@@ -2533,6 +2734,12 @@ def _reverse_logged_action(undo_data: dict) -> tuple[bool, str]:
         # Fallback for older log entries logged before outline_id was captured.
         return _com_remove_last_block(undo_data["page_id"])
 
+    if action_type == "insert_block_after":
+        outline_id = undo_data.get("outline_id")
+        if outline_id:
+            return _com_delete_page_content_object(undo_data["page_id"], outline_id)
+        return False, "This entry has no stable block ID recorded -- cannot safely undo it automatically."
+
     if action_type in ("delete_page", "insert_image_from_file"):
         return False, (
             f"'{action_type}' cannot be automatically undone -- restore it manually "
@@ -2612,6 +2819,9 @@ _ACTION_FIELD_LABELS = {
     "new_parent_id": "New parent ID",
     "new_parent_tag": "New parent type",
     "replace_all": "Replaced all occurrences",
+    "anchor_text": "Inserted after (text)",
+    "anchor_outline_id": "Inserted after (block ID)",
+    "file_path": "File path",
 }
 
 
@@ -2807,6 +3017,28 @@ def _apply_logged_action(data: dict) -> tuple[bool, str, dict]:
             # unsafe if anything else got appended in between. Keeping
             # the stale ID means that fallback undo instead fails loudly
             # against a nonexistent ID, which is the safe failure mode.
+            return True, f"{msg} (could not confirm the new block's exact ID -- a later undo of this entry may not target it precisely)", {}
+        return True, msg, {"outline_id": new_outline_id}
+
+    if action_type == "insert_block_after":
+        if "content" not in data:
+            return False, "This entry predates redo support (no content recorded) -- redo it by hand.", {}
+        anchor_outline_id = data.get("anchor_outline_id")
+        if anchor_outline_id:
+            # Targets the same anchor point directly, immune to
+            # anchor_text no longer uniquely (or at all) identifying the
+            # original block by now -- same reasoning as
+            # _com_replace_block_by_id vs re-resolving "the last block".
+            ok, msg, new_outline_id = _com_insert_outline_after_id(data["page_id"], anchor_outline_id, data["content"])
+        elif "anchor_text" in data:
+            # Fallback for entries logged before anchor-ID tracking
+            # existed -- re-resolves anchor_text fresh.
+            ok, msg, new_outline_id, _ = _com_insert_block_after(data["page_id"], data["anchor_text"], data["content"])
+        else:
+            return False, "This entry predates redo support (no anchor recorded) -- redo it by hand.", {}
+        if not ok:
+            return False, msg, {}
+        if not new_outline_id:
             return True, f"{msg} (could not confirm the new block's exact ID -- a later undo of this entry may not target it precisely)", {}
         return True, msg, {"outline_id": new_outline_id}
 

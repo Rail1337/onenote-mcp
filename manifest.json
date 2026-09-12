@@ -34,6 +34,7 @@
     { "name": "read_live_page", "description": "Read the full text of a single live page" },
     { "name": "read_live_section", "description": "Read every page in a section, live" },
     { "name": "append_to_page", "description": "Append content to an existing page" },
+    { "name": "insert_block_after", "description": "Insert a new block partway through a page, right after an existing block identified by its text" },
     { "name": "create_section_group", "description": "Create a new section group (folder) in a notebook" },
     { "name": "move_section", "description": "Move a section to a different section group, or restore one from the recycle bin" },
     { "name": "rename_section", "description": "Rename an existing section" },
