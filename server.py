@@ -1903,30 +1903,39 @@ Write-Output "OK"
 def _splice_paragraph_after(
     raw_html: str, anchor_text: str, new_paragraph_html: str
 ) -> tuple[str | None, int]:
-    """Given one OE's raw (already OneNote-sanitized, <br/>-delimited)
-    content, split it into paragraph-like segments on runs of <br/> tags,
-    find the ONE segment whose plain text contains anchor_text, and
-    return new raw content with new_paragraph_html spliced in as a fresh
-    paragraph immediately after it -- preserving every other segment's
-    original markup untouched (only the two new boundaries around the
-    inserted paragraph are added; existing separators elsewhere are kept
-    as-is).
+    """Given one OE's raw content, split it into paragraph-like segments
+    on runs of line-break tags, find the ONE segment whose plain text
+    contains anchor_text, and return new raw content with
+    new_paragraph_html spliced in as a fresh paragraph immediately after
+    it -- preserving every other segment's original markup untouched
+    (only the two new boundaries around the inserted paragraph are
+    added; existing separators elsewhere are kept as-is).
+
+    The split pattern matches <br\\s*/?>, same regex _sanitize_html_for_
+    onenote itself uses to recognize line breaks -- content this server
+    writes normalizes to a bare "<br/>", but content OneNote returns from
+    a real page (confirmed by dumping one) is "<br />" (with a space)
+    immediately followed by a literal newline, which a "<br/>"-only
+    pattern silently matches zero times, treating the entire block as one
+    giant unsplit paragraph. That was the actual bug behind Alex's first
+    real test: no split points found meant the anchor "matched" the
+    single whole-block segment, and insertion landed at the very end of
+    it -- the end of the page -- regardless of where anchor_text was.
 
     This is what makes insert_block_after actually insert IN PLACE within
     a page's reading flow, rather than only after whichever <one:Outline>
     the anchor happens to sit in -- a page written by a single create_page
     call has its ENTIRE body as one single OE/Outline with multiple
-    <br/>-separated paragraphs inside it, so anchoring at the Outline
-    level would always land at the end of the page, indistinguishable
-    from append_to_page, regardless of where in the text anchor_text
-    actually was.
+    paragraphs inside it, so anchoring at the Outline level would always
+    land at the end of the page, indistinguishable from append_to_page,
+    regardless of where in the text anchor_text actually was.
 
     Returns (new_raw_html, match_count). new_raw_html is None when
     match_count != 1 (0 = anchor not found in this block at all, >1 =
     anchor_text appears in more than one paragraph within this same
     block -- both reported honestly by the caller rather than guessed at).
     """
-    parts = re.split(r"((?:<br/>)+)", raw_html)
+    parts = re.split(r"((?:<br\s*/?>\s*)+)", raw_html, flags=re.IGNORECASE)
     segments = parts[0::2]
     seps = parts[1::2]
     n = len(segments)
@@ -1939,7 +1948,7 @@ def _splice_paragraph_after(
         return None, len(match_indices)
 
     idx = match_indices[0]
-    default_sep = seps[0] if seps else "<br/><br/>"
+    default_sep = "<br/><br/>"
 
     rebuilt = []
     for i in range(n):
