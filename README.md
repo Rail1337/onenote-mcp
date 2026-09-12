@@ -1,5 +1,7 @@
 I rebuilt this local MCP server so Claude can read and write my local Microsoft OneNote notebooks directly — no Microsoft account, API key, or Azure app registration needed, everything runs on my own machine. Windows only, since it drives the OneNote desktop app directly — no macOS/Linux support. It reads from OneNote's local backup snapshots for quick browsing and search, and talks directly to the running OneNote desktop app via its COM automation interface for always-current reads and for writing and organizing content.
 
+Have fun with it. Between live edits, undo/redo, and no longer hunting through nested sections by hand, I've caught myself opening OneNote's actual window less and less — Claude just does it for me now, correctly, most of the time. If it saves you even half the clicking it's saved me, consider your evening reclaimed.
+
 ## Story
 
 I run a D&D campaign, and years of session notes, NPC write-ups, quizzes, and my DM diary all live in OneNote. I didn't want to migrate all of that to Notion or one of the other note apps that already have an official Claude connector — OneNote is simply where the notes already were, and restructuring years of notebooks just to get a connector felt like the wrong trade-off. But I also didn't want to keep manually copy-pasting pages into Claude every time I needed context — "wait, what actually happened in session 4?" shouldn't mean digging through OneNote by hand every time. So instead of switching tools, I built the bridge myself.
