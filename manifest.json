@@ -4,7 +4,7 @@
   "display_name": "OneNote (Local)",
   "version": "1.2",
   "description": "Read, write, and organize local Microsoft OneNote notebooks (Windows only), both from local backups and live via the running OneNote app. No account, API key, or Azure setup needed.",
-  "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks on Windows. Reads from OneNote's local backup snapshots for quick browsing and search (including OCR text from embedded images), and drives the running OneNote desktop app via its COM API for always-current reads plus writing and organizing: creating, renaming, moving, and deleting sections, section groups, and pages (deletes require explicit confirmation and only move items to the recycle bin), and inserting images from a local file path.\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author. Stays open source under the same MIT license.",
+  "long_description": "Gives Claude direct access to local Microsoft OneNote notebooks on Windows. Reads from OneNote's local backup snapshots for quick browsing and search (including OCR text from embedded images), and drives the running OneNote desktop app via its COM API for always-current reads plus writing and organizing: creating, renaming, moving, and deleting sections, section groups, and pages (deletes require explicit confirmation and only move items to the recycle bin), and inserting images from a local file path.\n\nAlso edits existing pages directly -- find/replace exact text, or replace the last content block -- with undo and redo backed by a persistent action log (history.md) that survives restarts, so a mistaken edit can be reversed (and a mistaken undo redone) without digging through OneNote's own recycle bin by hand.\n\nOriginally created by mhzarem (https://github.com/mhzarem/onenote-mcp) under the MIT license. This is a modified, substantially extended derivative by Rail1337 -- not the original author. Stays open source under the same MIT license.",
   "author": {
     "name": "Rail1337"
   },
@@ -41,7 +41,14 @@
     { "name": "delete_section", "description": "Delete a section (recycle bin, requires confirm=true)" },
     { "name": "delete_page", "description": "Delete a page (recycle bin, requires confirm=true)" },
     { "name": "list_recycle_bin", "description": "List sections and pages currently in a notebook's recycle bin" },
-    { "name": "insert_image_from_file", "description": "Insert an image onto a page from a local file path (or bare filename in the default Downloads folder)" }
+    { "name": "insert_image_from_file", "description": "Insert an image onto a page from a local file path (or bare filename in the default Downloads folder)" },
+    { "name": "find_and_replace_in_page", "description": "Find and replace an exact piece of text within a page" },
+    { "name": "replace_last_block", "description": "Replace the last content block on a page, without needing to know what it said" },
+    { "name": "get_history_file_path", "description": "Show where the action history log (history.md) actually lives on disk" },
+    { "name": "list_recent_actions", "description": "List recently logged actions (creates, renames, moves, replacements, deletes), newest first" },
+    { "name": "undo_last_action", "description": "Undo the most recently logged action" },
+    { "name": "redo_last_action", "description": "Redo the most recently undone action" },
+    { "name": "list_drop_folder_images", "description": "List image files in the default image drop folder, newest first" }
   ],
   "compatibility": {
     "claude_desktop": ">=0.10.0",
