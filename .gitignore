@@ -14,3 +14,10 @@ wheels/
 
 # Packed extension bundles (build artifacts)
 *.mcpb
+
+# Personal action history (not for the public repo)
+history.md
+history.archive.md
+
+# Session work-log (context for us, not user-facing docs)
+session-log.txt

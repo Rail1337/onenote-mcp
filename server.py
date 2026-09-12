@@ -19,6 +19,10 @@ It exposes tools for Claude to:
     - List items in the OneNote recycle bin, and restore them via move
     (deletes require an explicit confirm=true and only move items to the
     recycle bin, never permanent)
+    - Find/replace text on a page, replace its last block, or append to it
+    - List recent actions, undo the last one, and redo the last undo --
+    backed by a persistent history.md log that survives restarts
+    - Insert an image from a local file, and list what's in the drop folder
 
 Prerequisites:
     pip install "mcp[cli]" pyOneNote
@@ -32,6 +36,7 @@ Usage with Claude Code:
 import base64
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -39,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pyOneNote.OneDocument import OneDocment
@@ -143,6 +149,178 @@ IMAGE_DROP_DIR = Path(
     os.environ.get("ONENOTE_IMAGE_DIR")
     or str(_get_windows_downloads_folder() or (Path.home() / "Downloads"))
 )
+
+# ---------------------------------------------------------------------------
+# Action history (persisted to a markdown file so it survives restarts and
+# can be reviewed by the user directly, or by Claude in a later session).
+# Not committed to the repo -- this is personal edit history, see .gitignore.
+# ---------------------------------------------------------------------------
+
+HISTORY_FILE = Path(__file__).resolve().parent / "history.md"
+HISTORY_ARCHIVE_FILE = Path(__file__).resolve().parent / "history.archive.md"
+HISTORY_LIMIT = 500
+
+
+def _log_action(summary: str, undo_data: dict) -> None:
+    """Append one entry to history.md, then rotate the oldest entries into
+    history.archive.md if the active log has grown past HISTORY_LIMIT.
+
+    Each line is "- " followed by one JSON object (timestamp, summary,
+    undone, plus whatever undo_last_action needs to reverse the action --
+    always including a "type" key). Storing the whole line as JSON, instead
+    of human text plus a text-delimited JSON blob, means there's no marker
+    string that caller-controlled text (e.g. find_text) could accidentally
+    collide with -- JSON's own string escaping handles arbitrary content
+    correctly regardless of what it contains. summary is still plain,
+    readable text if you open the file directly; list_recent_actions
+    re-renders it nicely rather than dumping the raw JSON.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {"timestamp": timestamp, "summary": summary, "undone": False, **undo_data}
+    line = f"- {json.dumps(entry)}\n"
+    try:
+        is_new = not HISTORY_FILE.exists()
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            if is_new:
+                f.write("# History\n\n")
+            f.write(line)
+        _rotate_history_if_needed()
+    except OSError as e:
+        log.warning("Could not write to history log: %s", e)
+
+
+def _rotate_history_if_needed() -> None:
+    """If history.md has grown past HISTORY_LIMIT entries, move the oldest
+    overflow entries into history.archive.md. Nothing is ever deleted."""
+    try:
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+
+    entry_indices = [i for i, l in enumerate(lines) if l.startswith("- ")]
+    if len(entry_indices) <= HISTORY_LIMIT:
+        return
+
+    overflow = len(entry_indices) - HISTORY_LIMIT
+    cutoff = entry_indices[overflow]  # index of the first entry line to KEEP
+    header_lines = lines[: entry_indices[0]]
+    archived_lines = lines[entry_indices[0]: cutoff]
+    kept_lines = lines[cutoff:]
+
+    try:
+        archive_is_new = not HISTORY_ARCHIVE_FILE.exists()
+        with open(HISTORY_ARCHIVE_FILE, "a", encoding="utf-8") as f:
+            if archive_is_new:
+                f.write("# History Archive\n\n")
+            f.writelines(archived_lines)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.writelines(header_lines)
+            f.writelines(kept_lines)
+    except OSError as e:
+        log.warning("Could not rotate history log: %s", e)
+
+
+def _read_history_entries() -> list[str]:
+    """Return the raw '- ...' entry lines from history.md, oldest first."""
+    try:
+        text = HISTORY_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line for line in text.splitlines() if line.startswith("- ")]
+
+
+def _parse_history_line(line: str) -> dict:
+    """Parse one history entry line (a "- " prefix followed by one JSON
+    object) into its timestamp, human summary, undo data, and whether it's
+    already marked undone."""
+    meta_keys = ("timestamp", "summary", "undone", "undone_at")
+    json_part = line[2:] if line.startswith("- ") else line
+    try:
+        entry = json.loads(json_part)
+    except json.JSONDecodeError as e:
+        log.warning("Could not parse history line as JSON: %s", e)
+        return {
+            "timestamp": "", "summary": line.strip(), "undo_data": {},
+            "undone": False, "undone_at": None, "raw": line,
+        }
+
+    undo_data = {k: v for k, v in entry.items() if k not in meta_keys}
+    return {
+        "timestamp": entry.get("timestamp", ""),
+        "summary": entry.get("summary", ""),
+        "undo_data": undo_data,
+        "undone": bool(entry.get("undone", False)),
+        "undone_at": entry.get("undone_at"),
+        "raw": line,
+    }
+
+
+def _find_last_undoable_action() -> dict | None:
+    """Return the parsed most-recent entry that hasn't been undone yet, or
+    None if the log is empty or everything in it is already undone."""
+    for line in reversed(_read_history_entries()):
+        parsed = _parse_history_line(line)
+        if not parsed["undone"]:
+            return parsed
+    return None
+
+
+def _find_last_redoable_action() -> dict | None:
+    """Return the parsed entry that is currently undone and was undone most
+    recently, or None if nothing is in an undone state right now.
+
+    Unlike _find_last_undoable_action, this can't just scan the file in
+    reverse: undo_last_action never appends a new line, it flips a flag on
+    an existing one, so an *older* entry can end up undone more recently
+    than a newer one (e.g. two undo_last_action calls in a row undo the
+    last two actions in order, making the second-to-last entry the most
+    recently undone). "Most recent" therefore means latest undone_at
+    timestamp, not file position.
+    """
+    candidates = [
+        parsed
+        for parsed in (_parse_history_line(line) for line in _read_history_entries())
+        if parsed["undone"] and parsed["undone_at"]
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p["undone_at"])
+    return candidates[-1]
+
+
+def _set_action_undone_flag(target_raw_line: str, undone: bool) -> bool:
+    """Rewrite history.md, setting the JSON entry matching target_raw_line
+    (matched by exact line content, which is unique since every entry
+    carries its own timestamp) to undone=True (recording when, for
+    _find_last_redoable_action) or back to undone=False (on redo, so the
+    entry becomes undoable again -- toggling back and forth repeatedly is
+    intentional, there's no separate "redone" state)."""
+    try:
+        text = HISTORY_FILE.read_text(encoding="utf-8")
+    except OSError as e:
+        log.warning("Could not read history log to update its undone flag: %s", e)
+        return False
+
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.rstrip("\n") == target_raw_line:
+            json_part = target_raw_line[2:] if target_raw_line.startswith("- ") else target_raw_line
+            try:
+                entry = json.loads(json_part)
+            except json.JSONDecodeError as e:
+                log.warning("Could not parse history entry to update its undone flag: %s", e)
+                return False
+            entry["undone"] = undone
+            if undone:
+                entry["undone_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            lines[i] = f"- {json.dumps(entry)}\n"
+            try:
+                HISTORY_FILE.write_text("".join(lines), encoding="utf-8")
+            except OSError as e:
+                log.warning("Could not update history log: %s", e)
+                return False
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Logging (to stderr so it doesn't break stdio MCP transport)
@@ -700,6 +878,34 @@ def _com_find_section_group_id(
     return None
 
 
+def _com_find_section_parent(notebook_name: str, section_id: str) -> tuple[str, str] | None:
+    """Find a section's current direct parent, as (parent_id, parent_tag)
+    where parent_tag is "Notebook" or "SectionGroup". Used to remember
+    where a section was before moving or deleting it, so that move can
+    later be undone.
+    """
+    root = _com_get_hierarchy(3)
+    if root is None:
+        return None
+
+    def walk(container: ET.Element, container_id: str, container_tag: str) -> tuple[str, str] | None:
+        for child in container:
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "Section" and child.get("ID") == section_id:
+                return (container_id, container_tag)
+            if tag == "SectionGroup":
+                found = walk(child, child.get("ID", ""), "SectionGroup")
+                if found:
+                    return found
+        return None
+
+    for nb in root.iter(f"{{{ONE_NS}}}Notebook"):
+        if nb.get("name", "").lower() != notebook_name.lower():
+            continue
+        return walk(nb, nb.get("ID", ""), "Notebook")
+    return None
+
+
 def _format_hierarchy_tree(node: ET.Element, depth: int = 0) -> list[str]:
     """Recursively render a Notebook/SectionGroup element's children as an
     indented tree of section-group folders and sections, skipping recycle-bin
@@ -980,6 +1186,22 @@ Write-Output $pageId
                 pass
 
 
+def _com_get_page_title(page_id: str) -> str | None:
+    """Fetch a live page's current title text (for capturing undo data
+    before renaming it)."""
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return None
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None
+    title_t = root.find(f"{{{ONE_NS}}}Title/{{{ONE_NS}}}OE/{{{ONE_NS}}}T")
+    if title_t is None or not title_t.text:
+        return None
+    return html.unescape(re.sub(r"<[^>]+>", "", title_t.text)).strip()
+
+
 def _com_rename_page(page_id: str, new_title: str) -> tuple[bool, str]:
     """Rename an existing page's title, leaving its body content untouched."""
     title_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_title.txt")
@@ -1143,14 +1365,332 @@ def _com_insert_image_from_file(page_id: str, file_path: str) -> tuple[bool, str
         # Fall back to the file extension if Pillow can't identify it.
         image_format = path.suffix.lstrip(".").lower()
 
+    # OneNote's <one:Image format="..."> attribute only accepts a fixed
+    # vocabulary (auto, bmp, gif, jpg, png, emf, wdp, ...) -- Pillow's own
+    # vocabulary calls the same format "jpeg", which OneNote's schema
+    # rejects outright, so insert_image_from_file failed for every .jpg
+    # file even though PNG worked fine.
+    if image_format == "jpeg":
+        image_format = "jpg"
+
     if not image_format:
         return False, f"Could not determine image format for: {file_path}"
 
     return _com_insert_image_bytes(page_id, raw_bytes, image_format)
 
 
-def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
-    """Append content to an existing page using the OneNote COM API."""
+def _com_find_and_replace_in_page(
+    page_id: str, find_text: str, replace_text: str, replace_all: bool = False
+) -> tuple[bool, str, int]:
+    """Find and replace text within a page.
+
+    Matches against each <one:OE> content block's whole plain text (its
+    direct <one:T> runs joined together first), so a match split across
+    sibling runs by inline formatting (e.g. text interrupted by <b>) is
+    still found. Replacing flattens that OE's runs into a single plain
+    text node, so any inline formatting *within that specific matched
+    block* is lost. Exact substring match only -- no fuzzy matching, so a
+    non-match is always reported honestly rather than guessed at.
+
+    Returns (ok, message, replacement_count).
+    """
+    if not find_text:
+        return False, "find_text must not be empty.", 0
+
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return False, "Could not read page content.", 0
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        return False, f"Could not parse page XML: {e}", 0
+
+    t_tag = f"{{{ONE_NS}}}T"
+    oe_tag = f"{{{ONE_NS}}}OE"
+
+    targets = []
+    total = 0
+    oe_index = -1
+    for oe in root.iter(oe_tag):
+        oe_index += 1
+        t_children = [c for c in list(oe) if c.tag == t_tag]
+        if not t_children:
+            continue
+
+        raw_joined = "".join(t.text or "" for t in t_children)
+        joined = html.unescape(re.sub(r"<[^>]+>", "", raw_joined))
+        if find_text not in joined:
+            continue
+
+        if replace_all:
+            n = joined.count(find_text)
+            new_joined = joined.replace(find_text, replace_text)
+        else:
+            new_joined = joined.replace(find_text, replace_text, 1)
+            n = 1
+
+        targets.append({
+            "index": oe_index,
+            "text": _escape_cdata(new_joined),
+            "expected_raw": raw_joined,
+        })
+        total += n
+        if not replace_all:
+            break
+
+    if not targets:
+        return True, "No match found; nothing was changed.", 0
+
+    targets_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_targets.json")
+    with open(targets_file, "w", encoding="utf-8") as f:
+        json.dump(targets, f)
+
+    page_id_esc = page_id.replace("'", "''")
+    script = f"""
+$targetsJson = Get-Content -Path '{targets_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+$targets = $targetsJson | ConvertFrom-Json
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeNodes = $xml.SelectNodes("//one:OE", $nsMgr)
+
+# Verify every target still has the exact content it had when Python
+# analyzed the page, before changing anything. GetPageContent is called
+# twice (once in Python, once here) as two separate COM round-trips; if the
+# page changed in between (a concurrent edit), applying the old plan could
+# silently hit the wrong block. Abort entirely rather than risk that.
+foreach ($target in $targets) {{
+    $oe = $oeNodes[$target.index]
+    if ($oe -eq $null) {{
+        Write-Error "Page structure changed since it was read (block no longer exists) -- aborting, nothing was modified."
+        exit 1
+    }}
+    $tNodes = @($oe.ChildNodes | Where-Object {{ $_.LocalName -eq "T" }})
+    $actualRaw = -join ($tNodes | ForEach-Object {{ $_.InnerText }})
+    if ($actualRaw -ne $target.expected_raw) {{
+        Write-Error "Page content changed since it was read -- aborting, nothing was modified. Please retry."
+        exit 1
+    }}
+}}
+
+foreach ($target in $targets) {{
+    $oe = $oeNodes[$target.index]
+    $tNodes = @($oe.ChildNodes | Where-Object {{ $_.LocalName -eq "T" }})
+    foreach ($tn in $tNodes) {{ $oe.RemoveChild($tn) | Out-Null }}
+    $newT = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+    $cdata = $xml.CreateCDataSection($target.text)
+    $newT.AppendChild($cdata) | Out-Null
+    $oe.AppendChild($newT) | Out-Null
+}}
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Find/replace UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("find_and_replace_in_page: page=%s ok=%s targets=%d output=%r",
+                  page_id, ok, len(targets), output[:200] if output else "(empty)")
+        if ok:
+            return True, "Replacement successful.", total
+        return False, f"Failed to update page: {output}", 0
+    finally:
+        try:
+            os.remove(targets_file)
+        except OSError:
+            pass
+
+
+def _com_replace_last_block(page_id: str, new_content: str) -> tuple[bool, str, str]:
+    """Replace the last <one:OE> content block on a page with new_content,
+    regardless of what it previously contained.
+
+    "Block" here means one <one:OE> element, OneNote's own unit of content.
+    A page built from a single create_page call (the common case) has
+    exactly one such block holding the *entire* body -- so on a page like
+    that, this replaces the whole page body, not just a trailing sentence
+    or paragraph. It only behaves like "undo what I just wrote" in the
+    narrower sense once the page has multiple blocks (e.g. after one or
+    more append_to_page calls). The returned message says so explicitly
+    when it happens, instead of leaving the caller to infer it.
+
+    Returns (ok, message, previous_plain_text) -- previous_plain_text is
+    the old block's plain text, captured for undo purposes.
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return False, "Could not read page content.", ""
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        return False, f"Could not parse page XML: {e}", ""
+
+    t_tag = f"{{{ONE_NS}}}T"
+    oe_tag = f"{{{ONE_NS}}}OE"
+    all_oe = list(root.iter(oe_tag))
+
+    # "Last block" means the last OE that actually has text in it -- a
+    # trailing image-only OE (e.g. from insert_image_from_file) shouldn't
+    # be mistaken for the last-written text block.
+    last_index = None
+    for i in range(len(all_oe) - 1, -1, -1):
+        if any(c.tag == t_tag for c in list(all_oe[i])):
+            last_index = i
+            break
+    if last_index is None:
+        return False, "This page has no content blocks to replace.", ""
+
+    last_oe = all_oe[last_index]
+    raw_old_text = "".join(c.text or "" for c in list(last_oe) if c.tag == t_tag)
+    old_text = html.unescape(re.sub(r"<[^>]+>", "", raw_old_text))
+    is_only_block = len(all_oe) == 1
+
+    body_html = _escape_cdata(_sanitize_html_for_onenote(new_content))
+    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_last_body.txt")
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(body_html)
+    expected_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_replace_last_expected.txt")
+    # newline="" disables Python's universal-newline translation on write, so
+    # the file holds the exact original bytes -- needed since this is
+    # compared byte-for-byte against the live XML's InnerText below.
+    with open(expected_file, "w", encoding="utf-8", newline="") as f:
+        f.write(raw_old_text)
+
+    page_id_esc = page_id.replace("'", "''")
+    script = f"""
+$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
+$expectedRaw = Get-Content -Path '{expected_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($expectedRaw -eq $null) {{ $expectedRaw = "" }}
+
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeNodes = $xml.SelectNodes("//one:OE", $nsMgr)
+$lastOe = $oeNodes[{last_index}]
+if ($lastOe -eq $null) {{
+    Write-Error "Page structure changed since it was read (block no longer exists) -- aborting, nothing was modified."
+    exit 1
+}}
+$tNodes = @($lastOe.ChildNodes | Where-Object {{ $_.LocalName -eq "T" }})
+$actualRaw = -join ($tNodes | ForEach-Object {{ $_.InnerText }})
+if ($actualRaw -ne $expectedRaw) {{
+    Write-Error "Page content changed since it was read -- aborting, nothing was modified. Please retry."
+    exit 1
+}}
+foreach ($tn in $tNodes) {{ $lastOe.RemoveChild($tn) | Out-Null }}
+$newT = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$cdata = $xml.CreateCDataSection($bodyContent)
+$newT.AppendChild($cdata) | Out-Null
+$lastOe.AppendChild($newT) | Out-Null
+
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Replace-last-block UpdatePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("replace_last_block: page=%s ok=%s output=%r", page_id, ok, output[:200] if output else "(empty)")
+        if ok:
+            msg = "Last block replaced successfully."
+            if is_only_block:
+                msg += (
+                    " Note: this page had only one content block, so this "
+                    "replaced the entire page body, not just a trailing part of it."
+                )
+            return True, msg, old_text
+        return False, f"Failed to replace last block: {output}", ""
+    finally:
+        try:
+            os.remove(body_file)
+        except OSError:
+            pass
+
+
+def _com_delete_page_content_object(page_id: str, object_id: str) -> tuple[bool, str]:
+    """Delete one page-level object (an Outline, Image, or Ink block) by its
+    objectID, via the dedicated DeletePageContent method.
+
+    UpdatePageContent cannot be used for removal -- confirmed by testing,
+    omitting an element from the XML passed to it does not delete it, it's
+    only additive/modifying. DeletePageContent is the correct API for
+    actually removing a page-level object.
+    """
+    page_id_esc = page_id.replace("'", "''")
+    object_id_esc = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+try {{
+    $onenote.DeletePageContent('{page_id_esc}', '{object_id_esc}')
+}} catch {{
+    Write-Error "DeletePageContent failed: $_"
+    exit 1
+}}
+Write-Output "OK"
+"""
+    ok, output = _run_powershell_file(script)
+    log.info("delete_page_content_object: page=%s object=%s ok=%s output=%r",
+              page_id, object_id, ok, output[:200] if output else "(empty)")
+    if ok:
+        return True, "Block removed successfully."
+    return False, f"Failed to remove block: {output}"
+
+
+def _com_remove_last_block(page_id: str) -> tuple[bool, str]:
+    """Remove the last top-level <one:Outline> content block on a page
+    entirely. Fallback for when a specific objectID isn't known -- prefer
+    _com_delete_page_content_object with an explicit ID when one is
+    available (e.g. from append_to_page's return value), since "whatever is
+    currently last" can be the wrong block if something else was added to
+    the page after the block this call is meant to target.
+    """
+    xml_content = _com_get_page_content(page_id)
+    if xml_content is None:
+        return False, "Could not read page content."
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        return False, f"Could not parse page XML: {e}"
+
+    outlines = list(root.iter(f"{{{ONE_NS}}}Outline"))
+    if not outlines:
+        return False, "This page has no content blocks to remove."
+
+    last_outline_id = outlines[-1].get("objectID")
+    if not last_outline_id:
+        return False, "Could not determine the last block's object ID."
+
+    return _com_delete_page_content_object(page_id, last_outline_id)
+
+
+def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str, str]:
+    """Append content to an existing page using the OneNote COM API.
+
+    Returns (ok, message, new_outline_id). new_outline_id is the objectID of
+    the freshly-created Outline block, captured immediately via a follow-up
+    GetPageContent call right after the append succeeds -- this lets undo
+    later target that *specific* block precisely, instead of assuming
+    whatever is "currently last" at undo time is still the right one (which
+    breaks if something else got added to the page in between).
+    """
     log.info("append_to_page: page=%s, body_len=%d", page_id, len(body_html))
     log.debug("append_to_page: raw body=%r", body_html[:500])
     body_html = _sanitize_html_for_onenote(body_html)
@@ -1194,14 +1734,26 @@ Write-Output "OK"
     try:
         ok, output = _run_powershell_file(script)
         log.info("append_to_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
-        if ok:
-            return True, "Content appended successfully."
-        return False, f"Failed to append content: {output}"
+        if not ok:
+            return False, f"Failed to append content: {output}", ""
     finally:
         try:
             os.remove(body_file)
         except OSError:
             pass
+
+    new_outline_id = ""
+    fresh_xml = _com_get_page_content(page_id)
+    if fresh_xml:
+        try:
+            fresh_root = ET.fromstring(fresh_xml)
+            outlines = list(fresh_root.iter(f"{{{ONE_NS}}}Outline"))
+            if outlines:
+                new_outline_id = outlines[-1].get("objectID", "")
+        except ET.ParseError as e:
+            log.warning("append_to_page: could not re-parse page to capture new block ID: %s", e)
+
+    return True, "Content appended successfully.", new_outline_id
 
 
 def _com_list_pages(section_id: str) -> list[dict]:
@@ -1271,6 +1823,13 @@ async def create_section(notebook_name: str, section_name: str) -> str:
 
     ok, result = _com_create_section(notebook_id, section_name)
     if ok:
+        _log_action(
+            f"create_section | notebook={notebook_name} | created section '{section_name}'",
+            {
+                "type": "create_section", "object_id": result,
+                "notebook_id": notebook_id, "section_name": section_name,
+            },
+        )
         return f"Section '{section_name}' created successfully (ID: {result})"
     return f"Failed to create section '{section_name}': {result}"
 
@@ -1294,6 +1853,13 @@ async def create_section_group(notebook_name: str, group_name: str) -> str:
 
     ok, result = _com_create_section_group(notebook_id, group_name)
     if ok:
+        _log_action(
+            f"create_section_group | notebook={notebook_name} | created group '{group_name}'",
+            {
+                "type": "create_section_group", "object_id": result,
+                "notebook_id": notebook_id, "group_name": group_name,
+            },
+        )
         return f"Section group '{group_name}' created successfully (ID: {result})"
     return f"Failed to create section group '{group_name}': {result}"
 
@@ -1333,9 +1899,24 @@ async def move_section(notebook_name: str, section_name: str, destination_group_
             return f"Could not find notebook '{notebook_name}'."
         destination_tag = "Notebook"
 
+    old_parent = _com_find_section_parent(notebook_name, section_id)
+
     ok, result = _com_move_section(section_id, destination_id, destination_tag)
     if ok:
         dest_desc = destination_group_name or f"the top level of '{notebook_name}'"
+        if old_parent:
+            old_parent_id, old_parent_tag = old_parent
+            _log_action(
+                f"move_section | section={section_name} | moved to {dest_desc}",
+                {
+                    "type": "move_section",
+                    "section_id": section_id,
+                    "old_parent_id": old_parent_id,
+                    "old_parent_tag": old_parent_tag,
+                    "new_parent_id": destination_id,
+                    "new_parent_tag": destination_tag,
+                },
+            )
         return f"Section '{section_name}' moved to {dest_desc}."
     return f"Failed to move section '{section_name}': {result}"
 
@@ -1358,6 +1939,13 @@ async def rename_section(notebook_name: str, section_name: str, new_name: str) -
 
     ok, result = _com_rename_section(section_id, new_name)
     if ok:
+        _log_action(
+            f"rename_section | section_id={section_id} | \"{section_name}\" -> \"{new_name}\"",
+            {
+                "type": "rename_section", "section_id": section_id,
+                "old_name": section_name, "new_name": new_name,
+            },
+        )
         return f"Section '{section_name}' renamed to '{new_name}'."
     return f"Failed to rename section '{section_name}': {result}"
 
@@ -1370,8 +1958,18 @@ async def rename_page(page_id: str, new_title: str) -> str:
         page_id: The page ID (from list_live_pages).
         new_title: New title for the page.
     """
+    old_title = _com_get_page_title(page_id)
+
     ok, result = _com_rename_page(page_id, new_title)
     if ok:
+        if old_title is not None:
+            _log_action(
+                f"rename_page | page_id={page_id} | \"{old_title}\" -> \"{new_title}\"",
+                {
+                    "type": "rename_page", "page_id": page_id,
+                    "old_title": old_title, "new_title": new_title,
+                },
+            )
         return f"Page renamed to '{new_title}'."
     return f"Failed to rename page: {result}"
 
@@ -1407,8 +2005,21 @@ async def delete_section(notebook_name: str, section_name: str, confirm: bool = 
             f"again with confirm=true."
         )
 
+    old_parent = _com_find_section_parent(notebook_name, section_id)
+
     ok, result = _com_delete_hierarchy(section_id)
     if ok:
+        if old_parent:
+            old_parent_id, old_parent_tag = old_parent
+            _log_action(
+                f"delete_section | notebook={notebook_name} | deleted section '{section_name}'",
+                {
+                    "type": "delete_section",
+                    "section_id": section_id,
+                    "old_parent_id": old_parent_id,
+                    "old_parent_tag": old_parent_tag,
+                },
+            )
         return f"Section '{section_name}' deleted (moved to recycle bin)."
     return f"Failed to delete section '{section_name}': {result}"
 
@@ -1436,6 +2047,10 @@ async def delete_page(page_id: str, confirm: bool = False) -> str:
 
     ok, result = _com_delete_hierarchy(page_id)
     if ok:
+        _log_action(
+            f"delete_page | page_id={page_id} | deleted (not automatically undoable)",
+            {"type": "delete_page", "page_id": page_id},
+        )
         return "Page deleted (moved to recycle bin)."
     return f"Failed to delete page: {result}"
 
@@ -1495,6 +2110,16 @@ async def create_page(notebook_name: str, section_name: str, title: str, content
         )
 
     ok, msg = _com_create_page(section_id, title, content)
+    if ok:
+        id_match = re.search(r"\(ID: (.+)\)$", msg)
+        if id_match:
+            _log_action(
+                f"create_page | notebook={notebook_name} | section={section_name} | created page '{title}'",
+                {
+                    "type": "create_page", "object_id": id_match.group(1),
+                    "section_id": section_id, "title": title, "content": content,
+                },
+            )
     return msg
 
 
@@ -1612,8 +2237,314 @@ async def append_to_page(page_id: str, content: str) -> str:
         page_id: The page ID (from list_live_pages).
         content: The content to append (plain text or HTML).
     """
-    ok, msg = _com_append_to_page(page_id, content)
+    ok, msg, new_outline_id = _com_append_to_page(page_id, content)
+    if ok:
+        _log_action(
+            f"append_to_page | page_id={page_id} | appended a new block",
+            {
+                "type": "append_to_page", "page_id": page_id,
+                "outline_id": new_outline_id, "content": content,
+            },
+        )
     return msg
+
+
+@mcp.tool()
+async def replace_last_block(page_id: str, new_content: str) -> str:
+    """Replace the last content block on a page with new_content, without
+    needing to know or repeat what it currently says.
+
+    Use this for "no, change what you just wrote" -- it always targets the
+    most recently written block on the page (typically the one just added
+    by append_to_page), regardless of what it contained. For editing
+    something older or deeper in a page, use find_and_replace_in_page
+    instead.
+
+    Caution on pages built from a single create_page call: that call puts
+    the entire body into one single block, so there "the last block" IS
+    the whole page body -- this will replace everything, not just a
+    trailing sentence. The returned message says so explicitly when it
+    happens. If you only want to change part of such a page, use
+    find_and_replace_in_page instead.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        new_content: The new content for that block (plain text or HTML).
+    """
+    ok, msg, old_text = _com_replace_last_block(page_id, new_content)
+    if ok:
+        _log_action(
+            f"replace_last_block | page_id={page_id} | replaced the last block",
+            {
+                "type": "replace_last_block", "page_id": page_id,
+                "old_text": old_text, "new_text": new_content,
+            },
+        )
+    return msg
+
+
+@mcp.tool()
+async def find_and_replace_in_page(
+    page_id: str, find_text: str, replace_text: str, replace_all: bool = False
+) -> str:
+    """Find and replace a specific piece of text within an existing page.
+
+    find_text must match exactly (case-sensitive, no fuzzy/approximate
+    matching) -- if in doubt, call read_live_page first to see the exact
+    current wording, then pass back the exact text you found there. If the
+    page's content came from a loosely-worded request (e.g. "change the
+    part about X"), identify the precise passage yourself from what
+    read_live_page returns, and ask the user to clarify if it's ambiguous
+    (e.g. it appears more than once) -- don't guess.
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        find_text: The exact text to search for.
+        replace_text: The text to replace it with.
+        replace_all: If true, replace every occurrence found; if false
+            (default), replace only the first one found.
+    """
+    ok, msg, count = _com_find_and_replace_in_page(page_id, find_text, replace_text, replace_all)
+    if ok and count > 0:
+        _log_action(
+            f"find_and_replace_in_page | page_id={page_id} | replaced \"{find_text}\" with \"{replace_text}\" ({count}x)",
+            {
+                "type": "find_and_replace_in_page",
+                "page_id": page_id,
+                "old_text": find_text,
+                "new_text": replace_text,
+                "replace_all": replace_all,
+            },
+        )
+    return msg
+
+
+def _reverse_logged_action(undo_data: dict) -> tuple[bool, str]:
+    """Reverse one logged action, based on its recorded undo_data. Returns
+    (ok, message). Some action types (delete_page, insert_image_from_file)
+    are intentionally not automatically reversible -- see history notes."""
+    action_type = undo_data.get("type")
+
+    if action_type == "rename_section":
+        return _com_rename_section(undo_data["section_id"], undo_data["old_name"])
+
+    if action_type == "rename_page":
+        return _com_rename_page(undo_data["page_id"], undo_data["old_title"])
+
+    if action_type in ("move_section", "delete_section"):
+        # Undoing a delete means moving the section back out of the recycle
+        # bin to where it was -- same underlying operation as undoing a move.
+        return _com_move_section(
+            undo_data["section_id"], undo_data["old_parent_id"], undo_data["old_parent_tag"]
+        )
+
+    if action_type in ("create_section", "create_section_group", "create_page"):
+        return _com_delete_hierarchy(undo_data["object_id"])
+
+    if action_type == "find_and_replace_in_page":
+        ok, msg, _ = _com_find_and_replace_in_page(
+            undo_data["page_id"], undo_data["new_text"], undo_data["old_text"],
+            replace_all=undo_data.get("replace_all", False),
+        )
+        return ok, msg
+
+    if action_type == "replace_last_block":
+        ok, msg, _ = _com_replace_last_block(undo_data["page_id"], undo_data["old_text"])
+        return ok, msg
+
+    if action_type == "append_to_page":
+        outline_id = undo_data.get("outline_id")
+        if outline_id:
+            return _com_delete_page_content_object(undo_data["page_id"], outline_id)
+        # Fallback for older log entries logged before outline_id was captured.
+        return _com_remove_last_block(undo_data["page_id"])
+
+    if action_type in ("delete_page", "insert_image_from_file"):
+        return False, (
+            f"'{action_type}' cannot be automatically undone -- restore it manually "
+            f"in OneNote if needed."
+        )
+
+    return False, f"Unknown action type in log: {action_type!r}"
+
+
+@mcp.tool()
+async def list_recent_actions(limit: int = 10) -> str:
+    """List the most recently logged actions (creates, renames, moves,
+    replacements, deletes, etc.), newest first.
+
+    Use this to see what actually happened before deciding whether to call
+    undo_last_action, or to figure out exactly what to fix yourself if the
+    wrong thing was changed.
+
+    Args:
+        limit: Maximum number of entries to show (default 10).
+    """
+    entries = _read_history_entries()
+    if not entries:
+        return "No actions logged yet."
+
+    recent = list(reversed(entries[-limit:]))
+    lines = []
+    for entry in recent:
+        parsed = _parse_history_line(entry)
+        marker = " [undone]" if parsed["undone"] else ""
+        lines.append(f"- {parsed['timestamp']} | {parsed['summary']}{marker}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def undo_last_action() -> str:
+    """Undo the most recent logged action.
+
+    Reverses whichever action is most recent in the history log (rename,
+    move, delete, find/replace, replace_last_block, append, or create) and
+    marks it as undone in the log. Deleting a page and inserting an image
+    cannot be automatically undone -- if the last action was one of those,
+    this reports that plainly instead of silently doing nothing or undoing
+    something older instead. Calling this repeatedly walks further back
+    through the log, one action at a time; redo_last_action reverses that.
+    """
+    last = _find_last_undoable_action()
+    if last is None:
+        return "Nothing to undo (no actions logged yet, or everything already undone)."
+
+    ok, msg = _reverse_logged_action(last["undo_data"])
+    if ok:
+        _set_action_undone_flag(last["raw"], True)
+        return f"Undid: {last['timestamp']} | {last['summary']}. ({msg})"
+    return f"Could not undo '{last['timestamp']} | {last['summary']}': {msg}"
+
+
+def _apply_logged_action(data: dict) -> tuple[bool, str]:
+    """Reapply one logged action forward -- the counterpart to
+    _reverse_logged_action, used by redo_last_action.
+
+    Some fields needed to redo an action (e.g. the name it was renamed TO,
+    or the content a block was replaced WITH) aren't needed for undo, so
+    they're only present on entries logged after redo support was added.
+    An older entry missing them is reported honestly as not redoable,
+    rather than guessed at or silently skipped.
+    """
+    action_type = data.get("type")
+
+    if action_type == "rename_section":
+        if "new_name" not in data:
+            return False, "This entry predates redo support (no new name recorded) -- redo it by hand."
+        return _com_rename_section(data["section_id"], data["new_name"])
+
+    if action_type == "rename_page":
+        if "new_title" not in data:
+            return False, "This entry predates redo support (no new title recorded) -- redo it by hand."
+        return _com_rename_page(data["page_id"], data["new_title"])
+
+    if action_type == "move_section":
+        if "new_parent_id" not in data:
+            return False, "This entry predates redo support (no destination recorded) -- redo it by hand."
+        return _com_move_section(data["section_id"], data["new_parent_id"], data["new_parent_tag"])
+
+    if action_type == "delete_section":
+        # Redoing a delete just means deleting it again -- section_id alone
+        # is enough, nothing extra to have captured at log time.
+        return _com_delete_hierarchy(data["section_id"])
+
+    if action_type == "create_section":
+        if "notebook_id" not in data or "section_name" not in data:
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
+        return _com_create_section(data["notebook_id"], data["section_name"])
+
+    if action_type == "create_section_group":
+        if "notebook_id" not in data or "group_name" not in data:
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
+        return _com_create_section_group(data["notebook_id"], data["group_name"])
+
+    if action_type == "create_page":
+        if "section_id" not in data or "title" not in data or "content" not in data:
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
+        return _com_create_page(data["section_id"], data["title"], data["content"])
+
+    if action_type == "find_and_replace_in_page":
+        # Already fully bidirectional from the start -- old_text/new_text
+        # are both stored for undo's sake, so redo just reapplies them as-is.
+        ok, msg, _ = _com_find_and_replace_in_page(
+            data["page_id"], data["old_text"], data["new_text"],
+            replace_all=data.get("replace_all", False),
+        )
+        return ok, msg
+
+    if action_type == "replace_last_block":
+        if "new_text" not in data:
+            return False, "This entry predates redo support (no new content recorded) -- redo it by hand."
+        ok, msg, _ = _com_replace_last_block(data["page_id"], data["new_text"])
+        return ok, msg
+
+    if action_type == "append_to_page":
+        if "content" not in data:
+            return False, "This entry predates redo support (no content recorded) -- redo it by hand."
+        ok, msg, _ = _com_append_to_page(data["page_id"], data["content"])
+        return ok, msg
+
+    if action_type in ("delete_page", "insert_image_from_file"):
+        return False, f"'{action_type}' was never undone in the first place, so there's nothing to redo."
+
+    return False, f"Unknown action type in log: {action_type!r}"
+
+
+@mcp.tool()
+async def redo_last_action() -> str:
+    """Redo the most recently undone action (the counterpart to
+    undo_last_action).
+
+    Finds whichever undone action was undone most recently and reapplies
+    it, regardless of how far back in the log it sits -- so undoing three
+    actions in a row and then calling this three times puts all three back,
+    in the right order. Entries logged before redo support existed don't
+    carry the data needed to redo them and are reported honestly rather
+    than guessed at. Deleting a page or inserting an image was never
+    undoable to begin with, so there's nothing for this to redo there.
+    """
+    last = _find_last_redoable_action()
+    if last is None:
+        return "Nothing to redo (no actions have been undone, or everything undone has already been redone)."
+
+    ok, msg = _apply_logged_action(last["undo_data"])
+    if ok:
+        _set_action_undone_flag(last["raw"], False)
+        return f"Redid: {last['timestamp']} | {last['summary']}. ({msg})"
+    return f"Could not redo '{last['timestamp']} | {last['summary']}': {msg}"
+
+
+@mcp.tool()
+async def list_drop_folder_images(limit: int = 20) -> str:
+    """List image files in the default image drop folder (see
+    insert_image_from_file), sorted newest first.
+
+    Use this to see what's actually available before calling
+    insert_image_from_file with a bare filename -- e.g. to find "the last
+    few files downloaded" instead of needing an already-known exact name.
+
+    Args:
+        limit: Maximum number of files to list (default 20).
+    """
+    if not IMAGE_DROP_DIR.is_dir():
+        return f"Image drop folder not found: {IMAGE_DROP_DIR}"
+
+    image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+    files = [
+        f for f in IMAGE_DROP_DIR.iterdir()
+        if f.is_file() and f.suffix.lower() in image_extensions
+    ]
+    if not files:
+        return f"No image files found in {IMAGE_DROP_DIR}"
+
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    lines = []
+    for f in files[:limit]:
+        stat = f.stat()
+        size_kb = stat.st_size / 1024
+        modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"- {f.name}  ({size_kb:.0f} KB, modified {modified})")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
