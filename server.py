@@ -2433,6 +2433,85 @@ async def list_recent_actions(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+# English labels for the raw undo_data keys get_action_detail dumps --
+# the keys themselves are internal (page_id, old_text, ...), these are
+# what a human should actually see.
+_ACTION_FIELD_LABELS = {
+    "page_id": "Page ID",
+    "section_id": "Section ID",
+    "notebook_id": "Notebook ID",
+    "object_id": "Object ID",
+    "outline_id": "Outline ID",
+    "old_name": "Old name",
+    "new_name": "New name",
+    "old_title": "Old title",
+    "new_title": "New title",
+    "old_text": "Old",
+    "new_text": "New",
+    "title": "Title",
+    "content": "Content",
+    "section_name": "Section name",
+    "group_name": "Group name",
+    "old_parent_id": "Old parent ID",
+    "old_parent_tag": "Old parent type",
+    "new_parent_id": "New parent ID",
+    "new_parent_tag": "New parent type",
+    "replace_all": "Replaced all occurrences",
+}
+
+
+@mcp.tool()
+async def get_action_detail(n: int = 1) -> str:
+    """Return the complete, unabridged data for one logged action -- not
+    the one-line summary list_recent_actions shows.
+
+    Args:
+        n: Which entry to fetch, counting back from the most recent
+            (1 = the last action, 2 = the one before that, ...). Matches
+            the order list_recent_actions lists entries in.
+
+    How to present this to the user: as a small table/detail card, one
+    row per field, English labels throughout (this project is for
+    general use, not tied to any one person's language) -- roughly
+    Timestamp, Action, Page, then whichever old/new or other
+    type-specific fields are present (already labeled below), in that
+    order. Leave out "Replaced all occurrences" -- how many matches got
+    replaced is rarely useful in this view, even though it's in the raw
+    data.
+
+    Add two rows yourself, written from the surrounding conversation, not
+    from this tool's output -- it has no way to know either:
+    - Reason: a short sentence on why this change was likely made.
+    - Summary: one sentence describing what the new value actually says.
+
+    If a page_id or section_id shows up, resolving it to a human-readable
+    name/path first (e.g. via list_live_pages or list_live_notebooks)
+    makes the table much more readable -- worth the extra call when
+    practical, but keep the raw ID visible too, since that's what other
+    tools here actually need.
+    """
+    entries = _read_history_entries()
+    if not entries:
+        return "No actions logged yet."
+    if n < 1 or n > len(entries):
+        return f"No entry at position {n} -- there are {len(entries)} logged action(s) (use list_recent_actions to see them)."
+
+    parsed = _parse_history_line(list(reversed(entries))[n - 1])
+    undo_data = dict(parsed["undo_data"])
+    action_type = undo_data.pop("type", "unknown")
+
+    lines = [
+        f"Timestamp: {parsed['timestamp']}",
+        f"Action: {action_type}",
+        f"Log summary: {parsed['summary']}",
+        f"Currently undone: {parsed['undone']}",
+    ]
+    for key, value in undo_data.items():
+        label = _ACTION_FIELD_LABELS.get(key, key)
+        lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def undo_last_action() -> str:
     """Undo the most recent logged action.

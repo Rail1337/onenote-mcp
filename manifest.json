@@ -46,6 +46,7 @@
     { "name": "replace_last_block", "description": "Replace the last content block on a page, without needing to know what it said" },
     { "name": "get_history_file_path", "description": "Show where the action history log (history.md) actually lives on disk" },
     { "name": "list_recent_actions", "description": "List recently logged actions (creates, renames, moves, replacements, deletes), newest first" },
+    { "name": "get_action_detail", "description": "Show the full, unabridged data for one logged action, not just its one-line summary" },
     { "name": "undo_last_action", "description": "Undo the most recently logged action" },
     { "name": "redo_last_action", "description": "Redo the most recently undone action" },
     { "name": "list_drop_folder_images", "description": "List image files in the default image drop folder, newest first" }
