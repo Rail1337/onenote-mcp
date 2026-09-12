@@ -1,0 +1,36 @@
+# Mirrors .gitignore's intent -- keep the packed .mcpb to just what a
+# user actually needs to run the server, none of the local dev/session
+# cruft that happens to sit in this folder.
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environment (Claude Desktop provides its own uv/Python runtime)
+.venv/
+
+# Lockfile/version pin -- not needed for a packed extension, uv resolves
+# from pyproject.toml at install time
+uv.lock
+.python-version
+
+# Token cache (contains auth secrets)
+.onenote_token_cache.json
+
+# Previously packed bundles (don't nest an old .mcpb inside a new one)
+*.mcpb
+
+# Personal action history (not for the public package)
+history.md
+history.archive.md
+
+# Session work-log (context for us, not user-facing)
+session-log.txt
+
+# Version control internals
+.git/
+.gitignore
