@@ -300,13 +300,18 @@ def _find_last_redoable_action() -> dict | None:
     return candidates[-1]
 
 
-def _set_action_undone_flag(target_raw_line: str, undone: bool) -> bool:
+def _set_action_undone_flag(target_raw_line: str, undone: bool, extra: dict | None = None) -> bool:
     """Rewrite history.md, setting the JSON entry matching target_raw_line
     (matched by exact line content, which is unique since every entry
     carries its own timestamp) to undone=True (recording when, for
     _find_last_redoable_action) or back to undone=False (on redo, so the
     entry becomes undoable again -- toggling back and forth repeatedly is
-    intentional, there's no separate "redone" state)."""
+    intentional, there's no separate "redone" state).
+
+    extra, when given, is merged into the entry at the same time -- used
+    by redo_last_action to refresh an entry's object_id/outline_id after
+    recreating something, since the recreated object never keeps its
+    original ID (see _apply_logged_action's docstring)."""
     try:
         text = HISTORY_FILE.read_text(encoding="utf-8")
     except OSError as e:
@@ -325,6 +330,8 @@ def _set_action_undone_flag(target_raw_line: str, undone: bool) -> bool:
             entry["undone"] = undone
             if undone:
                 entry["undone_at"] = _local_timestamp()
+            if extra:
+                entry.update(extra)
             lines[i] = f"- {json.dumps(entry)}\n"
             try:
                 HISTORY_FILE.write_text("".join(lines), encoding="utf-8")
@@ -2449,7 +2456,7 @@ async def undo_last_action() -> str:
     return f"Could not undo '{last['timestamp']} | {last['summary']}': {msg}"
 
 
-def _apply_logged_action(data: dict) -> tuple[bool, str]:
+def _apply_logged_action(data: dict) -> tuple[bool, str, dict]:
     """Reapply one logged action forward -- the counterpart to
     _reverse_logged_action, used by redo_last_action.
 
@@ -2458,69 +2465,97 @@ def _apply_logged_action(data: dict) -> tuple[bool, str]:
     they're only present on entries logged after redo support was added.
     An older entry missing them is reported honestly as not redoable,
     rather than guessed at or silently skipped.
+
+    Returns (ok, message, updates). updates is a dict of fields the caller
+    should merge into the history entry afterwards -- needed specifically
+    for the create_* and append_to_page types, whose undo (deleting the
+    object) means redo has to *recreate* it, which gets a brand new
+    object/outline ID from OneNote, never the original one. Without
+    updating the entry's stored ID to that new one, a second undo of the
+    same entry would try to delete the long-gone original ID instead of
+    the thing that's actually on the page now.
     """
     action_type = data.get("type")
 
     if action_type == "rename_section":
         if "new_name" not in data:
-            return False, "This entry predates redo support (no new name recorded) -- redo it by hand."
-        return _com_rename_section(data["section_id"], data["new_name"])
+            return False, "This entry predates redo support (no new name recorded) -- redo it by hand.", {}
+        ok, msg = _com_rename_section(data["section_id"], data["new_name"])
+        return ok, msg, {}
 
     if action_type == "rename_page":
         if "new_title" not in data:
-            return False, "This entry predates redo support (no new title recorded) -- redo it by hand."
-        return _com_rename_page(data["page_id"], data["new_title"])
+            return False, "This entry predates redo support (no new title recorded) -- redo it by hand.", {}
+        ok, msg = _com_rename_page(data["page_id"], data["new_title"])
+        return ok, msg, {}
 
     if action_type == "move_section":
         if "new_parent_id" not in data:
-            return False, "This entry predates redo support (no destination recorded) -- redo it by hand."
-        return _com_move_section(data["section_id"], data["new_parent_id"], data["new_parent_tag"])
+            return False, "This entry predates redo support (no destination recorded) -- redo it by hand.", {}
+        ok, msg = _com_move_section(data["section_id"], data["new_parent_id"], data["new_parent_tag"])
+        return ok, msg, {}
 
     if action_type == "delete_section":
         # Redoing a delete just means deleting it again -- section_id alone
-        # is enough, nothing extra to have captured at log time.
-        return _com_delete_hierarchy(data["section_id"])
+        # is enough, nothing extra to have captured at log time, and
+        # deleting doesn't mint a new ID the way recreating does.
+        ok, msg = _com_delete_hierarchy(data["section_id"])
+        return ok, msg, {}
 
     if action_type == "create_section":
         if "notebook_id" not in data or "section_name" not in data:
-            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
-        return _com_create_section(data["notebook_id"], data["section_name"])
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand.", {}
+        ok, result = _com_create_section(data["notebook_id"], data["section_name"])
+        if ok:
+            return True, f"Section recreated (new ID: {result})", {"object_id": result}
+        return False, result, {}
 
     if action_type == "create_section_group":
         if "notebook_id" not in data or "group_name" not in data:
-            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
-        return _com_create_section_group(data["notebook_id"], data["group_name"])
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand.", {}
+        ok, result = _com_create_section_group(data["notebook_id"], data["group_name"])
+        if ok:
+            return True, f"Section group recreated (new ID: {result})", {"object_id": result}
+        return False, result, {}
 
     if action_type == "create_page":
         if "section_id" not in data or "title" not in data or "content" not in data:
-            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand."
-        return _com_create_page(data["section_id"], data["title"], data["content"])
+            return False, "This entry predates redo support (no recreation data recorded) -- redo it by hand.", {}
+        ok, msg = _com_create_page(data["section_id"], data["title"], data["content"])
+        if ok:
+            id_match = re.search(r"\(ID: (.+)\)$", msg)
+            if id_match:
+                return True, msg, {"object_id": id_match.group(1)}
+        return ok, msg, {}
 
     if action_type == "find_and_replace_in_page":
         # Already fully bidirectional from the start -- old_text/new_text
         # are both stored for undo's sake, so redo just reapplies them as-is.
+        # Edits an existing block in place, so no new ID to track.
         ok, msg, _ = _com_find_and_replace_in_page(
             data["page_id"], data["old_text"], data["new_text"],
             replace_all=data.get("replace_all", False),
         )
-        return ok, msg
+        return ok, msg, {}
 
     if action_type == "replace_last_block":
         if "new_text" not in data:
-            return False, "This entry predates redo support (no new content recorded) -- redo it by hand."
+            return False, "This entry predates redo support (no new content recorded) -- redo it by hand.", {}
         ok, msg, _ = _com_replace_last_block(data["page_id"], data["new_text"])
-        return ok, msg
+        return ok, msg, {}
 
     if action_type == "append_to_page":
         if "content" not in data:
-            return False, "This entry predates redo support (no content recorded) -- redo it by hand."
-        ok, msg, _ = _com_append_to_page(data["page_id"], data["content"])
-        return ok, msg
+            return False, "This entry predates redo support (no content recorded) -- redo it by hand.", {}
+        ok, msg, new_outline_id = _com_append_to_page(data["page_id"], data["content"])
+        if ok:
+            return True, msg, {"outline_id": new_outline_id}
+        return False, msg, {}
 
     if action_type in ("delete_page", "insert_image_from_file"):
-        return False, f"'{action_type}' was never undone in the first place, so there's nothing to redo."
+        return False, f"'{action_type}' was never undone in the first place, so there's nothing to redo.", {}
 
-    return False, f"Unknown action type in log: {action_type!r}"
+    return False, f"Unknown action type in log: {action_type!r}", {}
 
 
 @mcp.tool()
@@ -2540,9 +2575,9 @@ async def redo_last_action() -> str:
     if last is None:
         return "Nothing to redo (no actions have been undone, or everything undone has already been redone)."
 
-    ok, msg = _apply_logged_action(last["undo_data"])
+    ok, msg, updates = _apply_logged_action(last["undo_data"])
     if ok:
-        _set_action_undone_flag(last["raw"], False)
+        _set_action_undone_flag(last["raw"], False, extra=updates)
         return f"Redid: {last['timestamp']} | {last['summary']}. ({msg})"
     return f"Could not redo '{last['timestamp']} | {last['summary']}': {msg}"
 
