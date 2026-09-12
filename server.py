@@ -2367,6 +2367,11 @@ async def insert_image_from_file(page_id: str, file_path: str) -> str:
             it's in the default drop folder (png, jpeg, gif, etc.).
     """
     ok, msg = _com_insert_image_from_file(page_id, file_path)
+    if ok:
+        _log_action(
+            f"insert_image_from_file | page_id={page_id} | inserted image from {file_path} (not automatically undoable)",
+            {"type": "insert_image_from_file", "page_id": page_id, "file_path": file_path},
+        )
     return msg
 
 
